@@ -46,6 +46,17 @@ function floatToPcm16(float32) {
   return pcm;
 }
 
+function concatUint8(chunks = []) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 export function bytesToBase64(bytes) {
   const uint8 = bytes instanceof Uint8Array
     ? bytes
@@ -67,9 +78,13 @@ export function base64ToBytes(base64) {
 }
 
 export class MicrophoneCapture {
-  constructor({ onPcmChunk, onLevel, onError, gateEnabled = true } = {}) {
+  constructor({ onPcmChunk, onPcmBytes, onLevel, onSpeechStart, onSpeechEnd, onUtterancePcm, onError, gateEnabled = true } = {}) {
     this.onPcmChunk = onPcmChunk;
+    this.onPcmBytes = onPcmBytes;
     this.onLevel = onLevel;
+    this.onSpeechStart = onSpeechStart;
+    this.onSpeechEnd = onSpeechEnd;
+    this.onUtterancePcm = onUtterancePcm;
     this.onError = onError;
     this.gateEnabled = gateEnabled;
     this.stream = null;
@@ -81,8 +96,11 @@ export class MicrophoneCapture {
     this.silentGain = null;
     this.running = false;
     this.sendEnabled = true;
-    this.noiseFloor = 0.0035;
+    this.noiseFloor = 0.0025;
     this.speechHangoverUntil = 0;
+    this.speechActive = false;
+    this.preRollChunks = [];
+    this.utteranceChunks = [];
   }
 
   async start() {
@@ -139,20 +157,65 @@ export class MicrophoneCapture {
         if (!this.sendEnabled) return;
 
         const now = performance.now();
-        const threshold = Math.min(0.028, Math.max(0.0045, this.noiseFloor * 2.25));
+        // Command capture must be more sensitive than the visual meter. The audio
+        // itself is never hard-gated; this threshold only decides when a short
+        // utterance ended so the fixed-command detector can inspect it.
+        const threshold = Math.min(0.008, Math.max(0.0008, this.noiseFloor * 1.12));
         const speaking = level >= threshold;
+        let startedNow = false;
+        let endedNow = false;
 
         if (speaking) {
-          this.speechHangoverUntil = now + 520;
+          this.speechHangoverUntil = now + 380;
+          if (!this.speechActive) {
+            this.speechActive = true;
+            startedNow = true;
+            // Preserve ~340 ms before speech start so the wake word "Mimi" is not clipped.
+            this.utteranceChunks = this.preRollChunks.map((chunk) => chunk.slice());
+            this.onSpeechStart?.();
+          }
         } else if (now > this.speechHangoverUntil) {
+          if (this.speechActive) {
+            endedNow = true;
+            this.speechActive = false;
+          }
           this.noiseFloor = (this.noiseFloor * 0.97) + (Math.min(level, 0.025) * 0.03);
         }
 
         const shouldGate = this.gateEnabled && !speaking && now > this.speechHangoverUntil;
-        const prepared = shouldGate ? new Float32Array(input.length) : new Float32Array(input);
+        const prepared = new Float32Array(input);
+        if (shouldGate) {
+          for (let i = 0; i < prepared.length; i += 1) prepared[i] *= 0.35;
+        }
         const resampled = downsampleBuffer(prepared, this.audioContext.sampleRate, 16000);
         const pcm16 = floatToPcm16(resampled);
-        const base64 = bytesToBase64(new Uint8Array(pcm16.buffer));
+        const pcmBytes = new Uint8Array(pcm16.buffer.slice(0));
+
+        if (this.speechActive || endedNow || startedNow) {
+          this.utteranceChunks.push(pcmBytes);
+        }
+
+        if (endedNow) {
+          const utterance = concatUint8(this.utteranceChunks);
+          this.utteranceChunks = [];
+          this.onSpeechEnd?.();
+          if (utterance.byteLength > 0) this.onUtterancePcm?.(utterance, 16000);
+        }
+
+        if (!this.speechActive) {
+          this.preRollChunks.push(pcmBytes);
+          // ScriptProcessor 4096 is ~85 ms/chunk at 48 kHz; 4 chunks ≈ 340 ms.
+          if (this.preRollChunks.length > 4) this.preRollChunks.shift();
+        } else {
+          this.preRollChunks = [];
+        }
+
+        // Keep an exact PCM copy in the app's current-turn ring buffer. This is
+        // the turn-audio fallback that lets us recover Person 2's source even when Live
+        // transcription returns late or misses the Vietnamese command.
+        this.onPcmBytes?.(pcmBytes);
+
+        const base64 = bytesToBase64(pcmBytes);
         this.onPcmChunk?.(base64);
       } catch (error) {
         this.onError?.(error);
@@ -170,15 +233,41 @@ export class MicrophoneCapture {
 
   pauseSending() {
     this.sendEnabled = false;
+    this.speechActive = false;
+    this.speechHangoverUntil = 0;
+    this.preRollChunks = [];
+    this.utteranceChunks = [];
   }
 
-  resumeSending() {
+  async resumeSending() {
+    if (!this.running) return;
+    const track = this.stream?.getAudioTracks?.()[0];
+    if (track) track.enabled = true;
+
+    // iPhone Safari may suspend the capture AudioContext while speaker audio is
+    // playing or after the app briefly loses focus. Resume it explicitly before
+    // reopening the send gate so the second speaker is heard reliably.
+    if (this.audioContext?.state === 'suspended') {
+      try { await this.audioContext.resume(); } catch {}
+    }
+
+    this.speechActive = false;
+    this.speechHangoverUntil = 0;
+    this.preRollChunks = [];
+    this.utteranceChunks = [];
     this.sendEnabled = true;
+  }
+
+  isHealthy() {
+    const track = this.stream?.getAudioTracks?.()[0];
+    return Boolean(this.running && track && track.readyState === 'live' && this.audioContext?.state !== 'closed');
   }
 
   async stop() {
     this.running = false;
     this.sendEnabled = false;
+    this.preRollChunks = [];
+    this.utteranceChunks = [];
 
     try { this.processorNode?.disconnect(); } catch {}
     try { this.compressorNode?.disconnect(); } catch {}
