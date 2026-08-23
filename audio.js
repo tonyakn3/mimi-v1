@@ -78,8 +78,9 @@ export function base64ToBytes(base64) {
 }
 
 export class MicrophoneCapture {
-  constructor({ onPcmChunk, onLevel, onSpeechStart, onSpeechEnd, onUtterancePcm, onError, gateEnabled = true } = {}) {
+  constructor({ onPcmChunk, onPcmBytes, onLevel, onSpeechStart, onSpeechEnd, onUtterancePcm, onError, gateEnabled = true } = {}) {
     this.onPcmChunk = onPcmChunk;
+    this.onPcmBytes = onPcmBytes;
     this.onLevel = onLevel;
     this.onSpeechStart = onSpeechStart;
     this.onSpeechEnd = onSpeechEnd;
@@ -156,13 +157,16 @@ export class MicrophoneCapture {
         if (!this.sendEnabled) return;
 
         const now = performance.now();
-        const threshold = Math.min(0.012, Math.max(0.0015, this.noiseFloor * 1.35));
+        // Command capture must be more sensitive than the visual meter. The audio
+        // itself is never hard-gated; this threshold only decides when a short
+        // utterance ended so the fixed-command detector can inspect it.
+        const threshold = Math.min(0.008, Math.max(0.0008, this.noiseFloor * 1.12));
         const speaking = level >= threshold;
         let startedNow = false;
         let endedNow = false;
 
         if (speaking) {
-          this.speechHangoverUntil = now + 620;
+          this.speechHangoverUntil = now + 500;
           if (!this.speechActive) {
             this.speechActive = true;
             startedNow = true;
@@ -205,6 +209,11 @@ export class MicrophoneCapture {
         } else {
           this.preRollChunks = [];
         }
+
+        // Keep an exact PCM copy in the app's current-turn ring buffer. This is
+        // the V1.7 fallback that lets us recover Person 2's source even when Live
+        // transcription returns late or misses the Vietnamese command.
+        this.onPcmBytes?.(pcmBytes);
 
         const base64 = bytesToBase64(pcmBytes);
         this.onPcmChunk?.(base64);

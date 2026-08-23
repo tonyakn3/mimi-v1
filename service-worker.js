@@ -1,4 +1,4 @@
-const CACHE = 'mimi-v1-6-dual-command-2026-08-23-2305';
+const CACHE = 'mimi-v1-7-reverse-rebuild-2026-08-23-2345';
 const APP_SHELL = [
   './',
   './index.html',
@@ -30,11 +30,12 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.startsWith('/api/')) return;
   if (event.request.method !== 'GET') return;
 
-  // Network-first for app code so an iPhone does not stay stuck on an old deploy.
+  // Always prefer the newest deployed app code. This is important on iPhone
+  // Add-to-Home-Screen, where old JS can otherwise survive a Render deploy.
   const isAppCode = /\.(?:js|css|html)$/.test(url.pathname) || url.pathname === '/';
   if (isAppCode) {
     event.respondWith(
-      fetch(event.request).then((response) => {
+      fetch(event.request, { cache: 'no-store' }).then((response) => {
         const copy = response.clone();
         caches.open(CACHE).then((cache) => cache.put(event.request, copy));
         return response;

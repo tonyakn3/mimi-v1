@@ -5,6 +5,8 @@ const MODEL = 'gemini-3.1-flash-live-preview';
 const VOICE_NAME = 'Kore';
 const TOKEN_ENDPOINT = '/api/live-token';
 const COMMAND_DETECT_ENDPOINT = '/api/detect-command';
+const TURN_RESOLVE_ENDPOINT = '/api/resolve-turn';
+const MAX_TURN_AUDIO_BYTES = 16000 * 2 * 60; // keep the latest ~60 seconds of the active human turn
 const WS_ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
 
 const LANGUAGES = [
@@ -119,7 +121,49 @@ const state = {
   currentSide: 1,
   activeCommandType: null,
   commandProbeCount: 0,
+  commandResolving: false,
+  turnAudioChunks: [],
+  turnAudioBytes: 0,
 };
+
+function clearTurnAudio() {
+  state.turnAudioChunks = [];
+  state.turnAudioBytes = 0;
+}
+
+function appendTurnAudio(pcmBytes) {
+  if (!state.running || state.playGate) return;
+  const bytes = pcmBytes instanceof Uint8Array ? pcmBytes : new Uint8Array(pcmBytes);
+  if (!bytes.byteLength) return;
+
+  const copy = bytes.slice();
+  state.turnAudioChunks.push(copy);
+  state.turnAudioBytes += copy.byteLength;
+
+  while (state.turnAudioBytes > MAX_TURN_AUDIO_BYTES && state.turnAudioChunks.length > 1) {
+    const removed = state.turnAudioChunks.shift();
+    state.turnAudioBytes -= removed.byteLength;
+  }
+}
+
+function currentTurnAudio() {
+  if (!state.turnAudioBytes || !state.turnAudioChunks.length) return new Uint8Array(0);
+  const out = new Uint8Array(state.turnAudioBytes);
+  let offset = 0;
+  for (const chunk of state.turnAudioChunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function expectedCommandType() {
+  return state.currentSide === 2 ? 'TRANSLATE' : 'SPEAK';
+}
+
+function commandLabel(type) {
+  return type === 'TRANSLATE' ? 'Mimi dịch' : 'Mimi nói';
+}
 
 function languageByCode(code) {
   const found = LANGUAGES.find(([langCode]) => langCode === code);
@@ -272,14 +316,13 @@ function sendAudio(base64Pcm) {
 }
 
 
-async function classifyCommandAudio(pcmBytes, sampleRate = 16000) {
+async function classifyCommandAudio(pcmBytes, sampleRate = 16000, expected = expectedCommandType()) {
   const bytes = pcmBytes instanceof Uint8Array ? pcmBytes : new Uint8Array(pcmBytes);
-  if (bytes.byteLength < 1600) return 'NONE';
+  if (bytes.byteLength < 1000) return 'NONE';
 
-  // Only the tail matters because the voice command is spoken at the end.
-  // Keeping this short also avoids uploading a long partner utterance to the
-  // command-classifier endpoint.
-  const maxBytes = Math.floor(sampleRate * 2 * 3.4);
+  // The fixed command is at the end of a short utterance. Give slow/natural
+  // Vietnamese up to 4.8 seconds so “Mimi dịch” is not clipped on iPhone.
+  const maxBytes = Math.floor(sampleRate * 2 * 4.8);
   const tail = bytes.byteLength > maxBytes ? bytes.subarray(bytes.byteLength - maxBytes) : bytes;
 
   const response = await fetch(COMMAND_DETECT_ENDPOINT, {
@@ -289,62 +332,88 @@ async function classifyCommandAudio(pcmBytes, sampleRate = 16000) {
     body: JSON.stringify({
       audio: bytesToBase64(tail),
       sampleRate,
+      expected,
     }),
   });
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || 'Command detector không phản hồi.');
-  return ['SPEAK', 'TRANSLATE'].includes(data.command) ? data.command : 'NONE';
+  return data.command === expected ? expected : 'NONE';
 }
 
-async function executeOrPendDetectedCommand(type, label) {
-  if (!state.running || state.playGate) return;
+async function resolveCurrentTurnAudio(type, sampleRate = 16000) {
+  const bytes = currentTurnAudio();
+  if (bytes.byteLength < 1000) return '';
+
+  const source = type === 'SPEAK' ? state.lang1 : state.lang2;
+  const response = await fetch(TURN_RESOLVE_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    cache: 'no-store',
+    body: JSON.stringify({
+      audio: bytesToBase64(bytes),
+      sampleRate,
+      expected: type,
+      sourceLanguage: `${source.name} (${source.code})`,
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || 'Không chốt được câu nguồn.');
+  if (!data.commandDetected) return '';
+  return stripCommandFallback(String(data.sourceText || '')).trim();
+}
+
+async function executeOrPendDetectedCommand(type, label = commandLabel(type)) {
+  if (!state.running || state.playGate || state.commandResolving) return;
+  if (type !== expectedCommandType()) return;
 
   const now = Date.now();
-  if (now - state.lastCommandAt < 850) return;
+  if (now - state.lastCommandAt < 800) return;
 
+  state.commandResolving = true;
+  state.lastCommandAt = now;
   setStatus('translating', `Đã nhận lệnh “${label}”`);
 
-  // Input transcription can arrive a little after the raw audio command detector.
-  // Give it a short window so the source sentence (especially Chinese) is preserved.
-  await new Promise((resolve) => setTimeout(resolve, 220));
-  if (!state.running || state.playGate) return;
+  try {
+    // V1.7: recover source from the actual PCM of the whole current turn first.
+    // This makes Person 2 -> Person 1 independent of Live transcription order.
+    let sourceText = '';
+    try {
+      sourceText = await resolveCurrentTurnAudio(type, 16000);
+    } catch (error) {
+      console.warn('Turn audio resolver:', error);
+    }
 
-  let sourceText = stripCommandFallback(state.transcriptBuffer).trim();
-  if (!sourceText) {
-    await new Promise((resolve) => setTimeout(resolve, 320));
-    sourceText = stripCommandFallback(state.transcriptBuffer).trim();
-  }
+    // Fast fallback when the Live transcript is already complete.
+    if (!sourceText) sourceText = stripCommandFallback(state.transcriptBuffer).trim();
 
-  if (!sourceText) {
-    state.pendingCommand = { type, at: Date.now(), detector: 'audio' };
-    setStatus('listening', `Đã nghe “${label}” · đang chốt câu...`);
-    return;
-  }
+    if (!sourceText) {
+      state.pendingCommand = { type, at: Date.now(), detector: 'audio' };
+      setStatus('listening', `Đã nghe “${label}” · đang chốt câu...`);
+      return;
+    }
 
-  state.pendingCommand = null;
-  state.lastCommandAt = Date.now();
-  executeTranslation(type, sourceText).catch((error) => {
+    state.pendingCommand = null;
+    await executeTranslation(type, sourceText);
+  } catch (error) {
     console.error(error);
-    recoverFromTranslationError(error.message || 'Không dịch được.');
-  });
+    await recoverFromTranslationError(error.message || 'Không dịch được.');
+  } finally {
+    state.commandResolving = false;
+  }
 }
 
 async function probeAudioForCommand(pcmBytes, sampleRate = 16000) {
-  if (!state.running || state.playGate || state.commandProbeCount >= 2) return;
+  if (!state.running || state.playGate || state.commandResolving || state.commandProbeCount >= 1) return;
+  const expected = expectedCommandType();
   state.commandProbeCount += 1;
   try {
-    const command = await classifyCommandAudio(pcmBytes, sampleRate);
-    if (!state.running || state.playGate || command === 'NONE') return;
-
-    if (command === 'SPEAK') {
-      await executeOrPendDetectedCommand('SPEAK', 'Mimi nói');
-    } else if (command === 'TRANSLATE') {
-      await executeOrPendDetectedCommand('TRANSLATE', 'Mimi dịch');
-    }
+    const command = await classifyCommandAudio(pcmBytes, sampleRate, expected);
+    if (!state.running || state.playGate || command !== expected) return;
+    await executeOrPendDetectedCommand(expected, commandLabel(expected));
   } catch (error) {
-    // This is a fallback detector. Live transcription/tool calling keeps working
-    // even if the classifier temporarily hits a quota/network error.
+    // Live transcription + function calling remain fallback paths.
     console.warn('Audio command detector:', error);
   } finally {
     state.commandProbeCount = Math.max(0, state.commandProbeCount - 1);
@@ -360,13 +429,15 @@ function maybeFulfillPendingCommand() {
     return false;
   }
 
-  const sourceText = stripCommandFallback(state.transcriptBuffer).trim();
+  let sourceText = stripCommandFallback(state.transcriptBuffer).trim();
   if (!sourceText) return false;
 
   const pending = state.pendingCommand;
+  if (pending.type !== expectedCommandType()) { state.pendingCommand = null; return false; }
   state.pendingCommand = null;
-  if (now - state.lastCommandAt < 700) return false;
-
+  // Do not debounce the pending path here. The command timestamp was already set
+  // when the audio detector heard it; waiting for another STT event can otherwise
+  // make the command disappear permanently.
   state.lastCommandAt = now;
   setStatus('translating', pending.type === 'SPEAK'
     ? 'Đã nhận lệnh “Mimi nói”'
@@ -475,6 +546,15 @@ async function handleToolCall(toolCall) {
       : fc.name === 'mimi_translate'
         ? 'TRANSLATE'
         : null;
+
+    if (type && type !== expectedCommandType()) {
+      functionResponses.push({
+        name: fc.name,
+        id: fc.id,
+        response: { result: 'ignored_wrong_turn' },
+      });
+      continue;
+    }
 
     if (!type) {
       functionResponses.push({
@@ -596,6 +676,8 @@ function maybeHandleCommand() {
     return;
   }
 
+  if (command.type !== expectedCommandType()) return;
+
   const sourceText = (command.sourceText || '').trim();
   if (!sourceText) {
     state.pendingCommand = { type: command.type, at: now };
@@ -678,6 +760,7 @@ async function finishTranslation() {
   state.transcriptBuffer = '';
   state.lastInputChunk = '';
   state.outputTranscript = '';
+  clearTurnAudio();
   await state.mic.resumeSending();
   // iOS can finish switching its audio route a fraction later; a second resume is
   // cheap and prevents the capture context from staying suspended after playback.
@@ -698,6 +781,8 @@ async function recoverFromTranslationError(message) {
   state.pendingCommand = null;
   state.transcriptBuffer = '';
   state.lastInputChunk = '';
+  clearTurnAudio();
+  state.commandResolving = false;
   await state.mic?.resumeSending();
   document.body.classList.remove('is-translating');
   els.startLabel.textContent = state.running ? 'KẾT THÚC' : 'BẮT ĐẦU';
@@ -737,6 +822,7 @@ async function startMimi() {
       // farther-away "Mimi dịch" must still reach Gemini. Browser noise suppression
       // + Gemini server VAD do the filtering; local VAD is only used as a fast turn hint.
       gateEnabled: false,
+      onPcmBytes: appendTurnAudio,
       onPcmChunk: sendAudio,
       onLevel: updateMicMeter,
       onSpeechStart: () => { state.localSpeechActive = true; },
@@ -766,6 +852,8 @@ async function startMimi() {
     state.pendingCommand = null;
     state.activeCommandType = null;
     state.commandProbeCount = 0;
+    state.commandResolving = false;
+    clearTurnAudio();
     state.currentSide = 1;
     els.startBtn.disabled = false;
     els.startLabel.textContent = 'KẾT THÚC';
@@ -792,6 +880,8 @@ async function stopMimi({ keepError = false } = {}) {
   state.pendingCommand = null;
   state.activeCommandType = null;
   state.commandProbeCount = 0;
+  state.commandResolving = false;
+  clearTurnAudio();
   state.currentSide = 1;
 
   try {
