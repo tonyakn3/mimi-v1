@@ -207,7 +207,7 @@ async function resolveTurnFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPE
   const raw = Buffer.from(base64Pcm, 'base64');
   if (raw.length < 1000) return { commandDetected: false, sourceText: '' };
 
-  // The client already keeps only the current turn, capped to ~60 seconds.
+  // The client keeps the complete current turn until translation finishes.
   const wav = pcm16ToWav(raw, sampleRate);
   const expectedPhrase = commandPhrase(expected);
   const prompt = [
@@ -237,7 +237,6 @@ async function resolveTurnFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPE
           sourceText: { type: 'STRING' },
         },
         required: ['commandDetected', 'sourceText'],
-        additionalProperties: false,
       },
     },
   });
@@ -330,7 +329,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/health' && req.method === 'GET') {
       json(res, 200, {
         ok: true,
-        version: '1.7.0',
+        version: '1.7.3',
         apiKeyConfigured: Boolean(GEMINI_API_KEY),
         liveModel: LIVE_MODEL,
         commandModel: COMMAND_MODEL,
@@ -380,7 +379,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       try {
-        const body = await readJsonBody(req, 4_500_000);
+        const body = await readJsonBody(req, 32_000_000);
         const { audio, sampleRate } = validateAudioPayload(body);
         const expected = normalizeExpected(body.expected);
         const sourceLanguage = String(body.sourceLanguage || '').slice(0, 120);

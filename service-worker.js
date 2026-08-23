@@ -1,4 +1,4 @@
-const CACHE = 'mimi-v1-7-reverse-rebuild-2026-08-23-2345';
+const CACHE = 'mimi-v1-7-3-command-only-2026-08-24';
 const APP_SHELL = [
   './',
   './index.html',

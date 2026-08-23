@@ -1,12 +1,14 @@
 import { detectMimiCommand, mergeTranscript, stripCommandFallback } from './commands.js';
 import { MicrophoneCapture, PcmOutputPlayer, bytesToBase64 } from './audio.js';
 
+const APP_VERSION = '1.7.3';
 const MODEL = 'gemini-3.1-flash-live-preview';
 const VOICE_NAME = 'Kore';
 const TOKEN_ENDPOINT = '/api/live-token';
 const COMMAND_DETECT_ENDPOINT = '/api/detect-command';
 const TURN_RESOLVE_ENDPOINT = '/api/resolve-turn';
-const MAX_TURN_AUDIO_BYTES = 16000 * 2 * 60; // keep the latest ~60 seconds of the active human turn
+// V1.7.2: no fixed duration cap for the active human turn.
+// The current turn is kept until translation finishes, then cleared.
 const WS_ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
 
 const LANGUAGES = [
@@ -140,10 +142,9 @@ function appendTurnAudio(pcmBytes) {
   state.turnAudioChunks.push(copy);
   state.turnAudioBytes += copy.byteLength;
 
-  while (state.turnAudioBytes > MAX_TURN_AUDIO_BYTES && state.turnAudioChunks.length > 1) {
-    const removed = state.turnAudioChunks.shift();
-    state.turnAudioBytes -= removed.byteLength;
-  }
+  // Do not trim older chunks. Long sentences must remain complete until the
+  // command is spoken and the turn is translated. The buffer is cleared after
+  // the translation finishes or when the session is stopped.
 }
 
 function currentTurnAudio() {
@@ -239,15 +240,12 @@ LANGUAGE PAIR
 - Person 2 language: ${l2.name} (${l2.code})
 
 CRITICAL COMMAND + TRANSPORT RULE
-- Live microphone audio is primarily listening/transcription context. NEVER speak, answer, acknowledge, translate, or react to ordinary live microphone audio by itself.
-- You have exactly two command tools: mimi_speak and mimi_translate.
-- If you hear the Vietnamese control phrase "Mimi nói", call mimi_speak immediately and put the complete Person 1 utterance immediately before the command into source_text.
-- If you hear the Vietnamese control phrase "Mimi dịch", call mimi_translate immediately and put the complete Person 2 utterance immediately before the command into source_text.
-- The phrase "Mimi dịch" is ALWAYS a Vietnamese app command even if the active speaker just spoke Chinese or another language. Give these two command phrases special priority and do not force them into the active conversation language.
-- Do not call a command tool merely because someone discusses the words as content; call it when the phrase is clearly used as the app control command.
-- After a command tool call, the client will send a tool response. Do NOT speak after the tool response. Wait for the private internal text instruction beginning exactly with [MIMI_EXECUTE].
-- ONLY when [MIMI_EXECUTE] arrives may you produce spoken audio.
-- When you do speak, output ONLY the translated utterance. No introduction, no explanation, no quotation marks, no "Mimi says", no extra comment.
+- Live microphone audio is LISTENING/TRANSCRIPTION CONTEXT ONLY.
+- NEVER speak, answer, acknowledge, translate, summarize, or react to ordinary microphone audio by itself, no matter how long the speaker talks and no matter how long they pause.
+- Silence, a long sentence, end-of-speech, or turn completion is NEVER permission to speak.
+- The client application detects the fixed Vietnamese commands "Mimi nói" and "Mimi dịch" independently. You MUST NOT infer, guess, or trigger either command yourself from ordinary conversation.
+- You are allowed to produce spoken audio ONLY after receiving a private internal text instruction beginning exactly with [MIMI_EXECUTE].
+- When [MIMI_EXECUTE] arrives, output ONLY the translated utterance. No introduction, no explanation, no quotation marks, no "Mimi says", no extra comment.
 
 INTERPRETING RULES
 1. Translate meaning naturally, as a skilled human interpreter would. Do not translate word-by-word when that sounds unnatural.
@@ -265,7 +263,7 @@ INTERPRETING RULES
 COMMAND SEMANTICS USED BY THE APP
 - "Mimi nói" means Person 1 -> Person 2.
 - "Mimi dịch" means Person 2 -> Person 1.
-The client also has an independent audio command detector as a fallback. If you hear either command, call the matching command tool, but never speak directly from the command audio. Spoken output is allowed only after [MIMI_EXECUTE].
+The browser/server command detector owns command recognition. Do not execute commands from audio yourself. Spoken output is allowed only after [MIMI_EXECUTE].
 `.trim();
 }
 
@@ -376,17 +374,21 @@ async function executeOrPendDetectedCommand(type, label = commandLabel(type)) {
   setStatus('translating', `Đã nhận lệnh “${label}”`);
 
   try {
-    // V1.7: recover source from the actual PCM of the whole current turn first.
-    // This makes Person 2 -> Person 1 independent of Live transcription order.
-    let sourceText = '';
-    try {
-      sourceText = await resolveCurrentTurnAudio(type, 16000);
-    } catch (error) {
-      console.warn('Turn audio resolver:', error);
-    }
+    // V1.7.2: use the continuously accumulated Live transcript first. This is
+    // fast and, unlike the old 60-second PCM ring buffer, does not drop the
+    // beginning of a long sentence.
+    let sourceText = stripCommandFallback(state.transcriptBuffer).trim();
 
-    // Fast fallback when the Live transcript is already complete.
-    if (!sourceText) sourceText = stripCommandFallback(state.transcriptBuffer).trim();
+    // Only fall back to re-resolving the raw current-turn PCM when Live STT has
+    // not produced usable source text. This keeps normal long turns fast while
+    // still preserving the robust audio fallback for missed/late transcripts.
+    if (!sourceText) {
+      try {
+        sourceText = await resolveCurrentTurnAudio(type, 16000);
+      } catch (error) {
+        console.warn('Turn audio resolver:', error);
+      }
+    }
 
     if (!sourceText) {
       state.pendingCommand = { type, at: Date.now(), detector: 'audio' };
@@ -405,6 +407,8 @@ async function executeOrPendDetectedCommand(type, label = commandLabel(type)) {
 }
 
 async function probeAudioForCommand(pcmBytes, sampleRate = 16000) {
+  // This independent fixed-command classifier is the ONLY automatic trigger.
+  // Ordinary source speech, regardless of duration, can never start translation.
   if (!state.running || state.playGate || state.commandResolving || state.commandProbeCount >= 1) return;
   const expected = expectedCommandType();
   state.commandProbeCount += 1;
@@ -470,18 +474,19 @@ async function connectGemini() {
       const setupMessage = {
         setup: {
           model: `models/${MODEL}`,
-          generationConfig: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: VOICE_NAME },
-              },
+          // Raw Gemini Live WebSocket config: audio output and voice belong
+          // directly under setup. Keeping them under generationConfig can
+          // leave the session without native audio output.
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: VOICE_NAME },
             },
           },
+          thinkingConfig: { thinkingLevel: 'minimal' },
           systemInstruction: {
             parts: [{ text: buildSystemInstruction() }],
           },
-          tools: COMMAND_TOOLS,
           realtimeInputConfig: {
             automaticActivityDetection: {
               disabled: false,
@@ -506,14 +511,20 @@ async function connectGemini() {
         const raw = typeof event.data === 'string' ? event.data : await event.data.text();
         const response = JSON.parse(raw);
 
+        if (response.error) {
+          const message = response.error.message || response.error.status || 'Gemini Live báo lỗi.';
+          fail(new Error(message));
+          if (state.running) {
+            setStatus('error', 'Gemini Live lỗi');
+            showError(message);
+          }
+          return;
+        }
+
         if (response.setupComplete && !settled) {
           settled = true;
           resolve();
           return;
-        }
-
-        if (response.toolCall) {
-          await handleToolCall(response.toolCall);
         }
 
         await handleServerMessage(response);
@@ -639,7 +650,9 @@ async function handleServerMessage(response) {
   }
 
   if (content.outputTranscription?.text && state.playGate) {
-    state.translationHasOutput = true;
+    // Transcript alone is not proof that audible PCM arrived. Only mark the
+    // turn as having audio when inlineData is received, otherwise Safari can
+    // falsely finish a silent turn.
     state.outputTranscript += content.outputTranscription.text;
   }
 
@@ -728,11 +741,9 @@ async function executeTranslation(type, sourceText) {
   els.startLabel.textContent = 'ĐANG DỊCH';
   document.body.classList.add('is-translating');
 
-  // Explicitly close the current mic stream turn before sending the private execution text.
-  // This prevents the final spoken command from remaining buffered together with the text trigger.
-  sendJson({ realtimeInput: { audioStreamEnd: true } });
-  await new Promise((resolve) => setTimeout(resolve, 140));
-
+  // V1.7.3: do NOT close the Live audio turn here. audioStreamEnd may itself
+  // cause a model response after a long spoken turn. The private [MIMI_EXECUTE]
+  // text is the sole permission for Mimi to produce audio.
   const prompt = buildExecutionPrompt(type, sourceText);
   if (!sendJson({ realtimeInput: { text: prompt } })) {
     throw new Error('Kết nối Gemini chưa sẵn sàng.');
@@ -827,8 +838,12 @@ async function startMimi() {
       onLevel: updateMicMeter,
       onSpeechStart: () => { state.localSpeechActive = true; },
       onSpeechEnd: () => {
+        // IMPORTANT V1.7.3: ordinary silence/end-of-speech must NEVER close the
+        // Gemini audio turn. Long speech often contains natural pauses; closing
+        // the turn here can make the Live model respond even though no Mimi
+        // command was spoken. The independent fixed-command detector below is
+        // the only path allowed to trigger translation.
         state.localSpeechActive = false;
-        flushAudioTurnFast();
       },
       // Independent command path: send the just-finished mic utterance to a tiny
       // audio classifier. This does NOT depend on Live transcription, so
