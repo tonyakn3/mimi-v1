@@ -177,50 +177,112 @@ async function geminiGenerate({ model, prompt, wav, generationConfig }) {
 
 async function detectExpectedCommandFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPEAK') {
   const raw = Buffer.from(base64Pcm, 'base64');
-  if (raw.length < 1000) return false;
+  if (raw.length < 1000) {
+    return {
+      commandDetected: false,
+      wakeDetected: false,
+      intentDetected: false,
+      speechAfterIntent: false,
+      boundaryBeforeWake: false,
+      isolatedCommand: false,
+    };
+  }
 
-  // Only the tail matters because the command is always spoken after the source.
-  // 4.8 seconds is intentionally generous for natural/slow Vietnamese speech.
-  const maxBytes = Math.floor(sampleRate * 2 * 4.8);
+  // V1.8: classify the control phrase as two parts: wake word "Mimi" and the
+  // state-locked intent word. This avoids treating the shared "Mimi" prefix as
+  // the command by itself. Only the expected command for the active turn can fire.
+  const maxBytes = Math.floor(sampleRate * 2 * 5.2);
   const tail = raw.length > maxBytes ? raw.subarray(raw.length - maxBytes) : raw;
   const wav = pcm16ToWav(tail, sampleRate);
   const expectedPhrase = commandPhrase(expected);
+  const expectedIntent = expected === 'TRANSLATE' ? 'dịch' : 'nói';
 
   const prompt = [
-    'You are a strict Vietnamese fixed-command detector for an interpreter app named Mimi.',
-    `Expected command: "${expectedPhrase}".`,
-    'Listen specifically to the END of this audio.',
-    `Return HIT only if the speaker actually says "${expectedPhrase}" as the app command near the end.`,
-    'Return NONE otherwise.',
-    'The audio before it may be Chinese, Vietnamese, English, mixed technical speech, music from another device, or room noise.',
-    'Accept natural Southern Vietnamese pronunciation, normal speaking speed, mild clipping, mild noise, and small pauses between Mimi and the last word.',
-    'Do not require perfect transcription. Judge the sound of the command.',
-    'Do not infer the command from context.',
-    'Output exactly HIT or NONE and nothing else.',
+    'You are the strict command recognizer for a Vietnamese voice interpreter app named Mimi.',
+    `ACTIVE TURN EXPECTS ONLY: "${expectedPhrase}".`,
+    'Treat the command as TWO stages: wake word = "Mimi", then intent word = the expected final word.',
+    `Expected intent word: "${expectedIntent}".`,
+    'Listen to the END of the supplied audio, especially the last 2 seconds.',
+    'A valid command requires ALL of these:',
+    '1) the speaker audibly says the wake word "Mimi";',
+    `2) after Mimi, the speaker audibly says the expected intent word "${expectedIntent}";`,
+    '3) there is no meaningful speech after that intent word;',
+    '4) either the command is a short standalone utterance OR there is a clear phrase/sentence boundary or natural pause before "Mimi".',
+    'Do NOT trigger if "Mimi" and the intent are merely discussed inside a longer sentence.',
+    'Do NOT trigger if words continue after the command phrase, e.g. "Mimi dịch câu này..." or "Mimi nói chuyện...".',
+    'Do NOT trigger on the wake word "Mimi" alone.',
+    'Do NOT infer a command from context. Judge only the actual audio.',
+    'Accept natural Southern Vietnamese pronunciation and a short unreleased final consonant in "dịch". Mild noise/clipping is okay.',
+    'The audio before the command may be Chinese, English, Vietnamese, mixed technical speech, or room noise; ignore its language when recognizing the final Vietnamese command.',
+    'Return JSON matching the schema only.',
   ].join('\n');
 
-  const text = await geminiGenerate({ model: COMMAND_MODEL, prompt, wav });
-  return /^HIT\b/i.test(text);
+  const text = await geminiGenerate({
+    model: COMMAND_MODEL,
+    prompt,
+    wav,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          wakeDetected: { type: 'BOOLEAN' },
+          intentDetected: { type: 'BOOLEAN' },
+          speechAfterIntent: { type: 'BOOLEAN' },
+          boundaryBeforeWake: { type: 'BOOLEAN' },
+          isolatedCommand: { type: 'BOOLEAN' },
+        },
+        required: ['wakeDetected', 'intentDetected', 'speechAfterIntent', 'boundaryBeforeWake', 'isolatedCommand'],
+        additionalProperties: false,
+      },
+    },
+  });
+
+  try {
+    const parsed = JSON.parse(text);
+    const wakeDetected = Boolean(parsed.wakeDetected);
+    const intentDetected = Boolean(parsed.intentDetected);
+    const speechAfterIntent = Boolean(parsed.speechAfterIntent);
+    const boundaryBeforeWake = Boolean(parsed.boundaryBeforeWake);
+    const isolatedCommand = Boolean(parsed.isolatedCommand);
+    const commandDetected = wakeDetected
+      && intentDetected
+      && !speechAfterIntent
+      && (boundaryBeforeWake || isolatedCommand);
+
+    return {
+      commandDetected,
+      wakeDetected,
+      intentDetected,
+      speechAfterIntent,
+      boundaryBeforeWake,
+      isolatedCommand,
+    };
+  } catch {
+    throw new Error('Gemini trả dữ liệu command detector không hợp lệ.');
+  }
 }
 
 async function resolveTurnFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPEAK', sourceLanguage = '') {
   const raw = Buffer.from(base64Pcm, 'base64');
-  if (raw.length < 1000) return { commandDetected: false, sourceText: '' };
+  if (raw.length < 1000) return { commandDetected: true, sourceText: '' };
 
-  // The client already keeps only the current turn, capped to ~60 seconds.
+  // V1.8: the dedicated wake+intent detector already confirmed the command.
+  // Do NOT ask a second model call to decide whether the command exists again;
+  // that second decision was able to lose "Mimi dịch". This step only recovers
+  // the source speech that occurred before the confirmed trailing command.
   const wav = pcm16ToWav(raw, sampleRate);
   const expectedPhrase = commandPhrase(expected);
   const prompt = [
-    'You are recovering one turn for a professional two-person interpreter app.',
-    `The source language is ${sourceLanguage || 'the language spoken before the command'}.`,
-    `The only valid trailing app command for this turn is the Vietnamese phrase "${expectedPhrase}".`,
-    `Determine whether "${expectedPhrase}" is actually spoken near the END of the audio.`,
-    'If it is present, transcribe ALL source speech that came before that command, faithfully and in its ORIGINAL language.',
-    'Remove only the app command itself. Do not translate the source.',
+    'You are recovering the source speech from one already-confirmed interpreter turn.',
+    `Source language: ${sourceLanguage || 'the language spoken before the command'}.`,
+    `The trailing Vietnamese app command "${expectedPhrase}" has ALREADY BEEN CONFIRMED by a separate detector.`,
+    `Transcribe ALL meaningful source speech that came before the final command "${expectedPhrase}" in its ORIGINAL language.`,
+    'Remove only that final command and trailing silence/noise. Do not translate the source.',
+    'If the command was spoken as a separate short utterance after the source, keep the earlier source speech.',
     'Preserve numbers, prices, currencies, dimensions, model numbers, brands, product codes, English technical terms and mixed-language terms exactly when audible.',
-    'Ignore room noise and the Mimi app voice if any residual echo exists.',
-    'If no valid trailing command is present, commandDetected must be false.',
-    'If the command is present but the source is empty, sourceText may be empty.',
+    'Ignore room noise and residual Mimi speaker echo.',
+    'If there is genuinely no source speech before the command, return an empty sourceText.',
     'Return JSON matching the provided schema only.',
   ].join('\n');
 
@@ -233,10 +295,9 @@ async function resolveTurnFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPE
       responseSchema: {
         type: 'OBJECT',
         properties: {
-          commandDetected: { type: 'BOOLEAN' },
           sourceText: { type: 'STRING' },
         },
-        required: ['commandDetected', 'sourceText'],
+        required: ['sourceText'],
         additionalProperties: false,
       },
     },
@@ -245,7 +306,7 @@ async function resolveTurnFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPE
   try {
     const parsed = JSON.parse(text);
     return {
-      commandDetected: Boolean(parsed.commandDetected),
+      commandDetected: true,
       sourceText: String(parsed.sourceText || '').replace(/\s+/g, ' ').trim(),
     };
   } catch {
@@ -330,7 +391,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/health' && req.method === 'GET') {
       json(res, 200, {
         ok: true,
-        version: '1.7.0',
+        version: '1.8.0',
         apiKeyConfigured: Boolean(GEMINI_API_KEY),
         liveModel: LIVE_MODEL,
         commandModel: COMMAND_MODEL,
@@ -356,8 +417,16 @@ const server = http.createServer(async (req, res) => {
         const body = await readJsonBody(req, 900_000);
         const { audio, sampleRate } = validateAudioPayload(body);
         const expected = normalizeExpected(body.expected);
-        const hit = await detectExpectedCommandFromPcm(audio, sampleRate, expected);
-        json(res, 200, { command: hit ? expected : 'NONE' });
+        const result = await detectExpectedCommandFromPcm(audio, sampleRate, expected);
+        json(res, 200, {
+          command: result.commandDetected ? expected : 'NONE',
+          expected,
+          wakeDetected: result.wakeDetected,
+          intentDetected: result.intentDetected,
+          speechAfterIntent: result.speechAfterIntent,
+          boundaryBeforeWake: result.boundaryBeforeWake,
+          isolatedCommand: result.isolatedCommand,
+        });
       } catch (error) {
         console.error('Command detector error:', error.message);
         json(res, 502, { error: `Không nhận diện được câu lệnh: ${error.message}` });
@@ -438,7 +507,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Mimi V1.7 đang chạy tại http://localhost:${PORT}`);
+  console.log(`Mimi V1.8 đang chạy tại http://localhost:${PORT}`);
   console.log(`Gemini API key: ${GEMINI_API_KEY ? 'đã cấu hình' : 'CHƯA cấu hình'}`);
   console.log(`Live model: ${LIVE_MODEL} | Command model: ${COMMAND_MODEL}`);
 });

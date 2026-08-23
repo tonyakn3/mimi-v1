@@ -1,10 +1,18 @@
-const COMMAND_PATTERNS = [
-  { type: 'SPEAK', regex: /\bmi\s*mi\s*[,.:;\-–—]?\s*n(?:o|ó)i\b/iu },
-  { type: 'TRANSLATE', regex: /\bmi\s*mi\s*[,.:;\-–—]?\s*d(?:i|ị)ch\b/iu },
+const TRAILING_COMMANDS = [
+  {
+    type: 'SPEAK',
+    // Command must be at the end. This deliberately does NOT match
+    // "Mimi nói chuyện..." or any phrase with meaningful words after it.
+    regex: /(?:^|[\s.!?…,:;\-–—])mi\s*mi\s*[,.:;\-–—]?\s*n(?:o|ó)i\s*[.!?…,:;\-–—]*\s*$/iu,
+  },
+  {
+    type: 'TRANSLATE',
+    regex: /(?:^|[\s.!?…,:;\-–—])mi\s*mi\s*[,.:;\-–—]?\s*(?:d(?:i|ị)ch|dich|dick|dict|dik)\s*[.!?…,:;\-–—]*\s*$/iu,
+  },
 ];
 
 function normalizeForCommand(text = '') {
-  return text
+  return String(text)
     .toLocaleLowerCase('vi-VN')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
@@ -14,35 +22,45 @@ function normalizeForCommand(text = '') {
     .trim();
 }
 
-function globalize(regex) {
-  const flags = new Set(regex.flags.split(''));
-  flags.add('g');
-  return new RegExp(regex.source, [...flags].join(''));
-}
-
 function cleanSourceText(text = '') {
-  return String(text)
-    .replace(/\s+/g, ' ')
-    .trim();
+  return String(text).replace(/\s+/g, ' ').trim();
 }
 
-/**
- * Remove a Mimi command wherever it appears in the transcript, while keeping
- * source speech that may arrive before OR after it.
- *
- * Gemini input transcription is asynchronous. In a bilingual turn it may
- * return the Vietnamese command "Mimi dịch" before the partner's Chinese
- * transcript even though the Chinese was spoken first. Keeping text on both
- * sides of the command prevents the reverse direction from losing the source.
- */
-function removeCommandAnywhere(text = '', regex) {
-  return cleanSourceText(String(text).replace(globalize(regex), ' '));
+function trailingNormalizedCommand(normalized = '') {
+  const candidates = [
+    { type: 'SPEAK', phrases: ['mimi noi', 'mi mi noi'] },
+    { type: 'TRANSLATE', phrases: ['mimi dich', 'mi mi dich', 'mimi dick', 'mi mi dick', 'mimi dict', 'mi mi dict', 'mimi dik', 'mi mi dik'] },
+  ];
+
+  for (const candidate of candidates) {
+    for (const phrase of candidate.phrases) {
+      if (normalized === phrase || normalized.endsWith(` ${phrase}`)) {
+        return { type: candidate.type, phrase };
+      }
+    }
+  }
+  return null;
 }
 
-function stripKnownCommandAnywhere(text = '') {
-  // Covers normal Vietnamese plus common STT variants such as "Mimi Dick".
-  return cleanSourceText(String(text).replace(
-    /\bmi\s*mi\s*[,.:;\-–—]?\s*(?:n(?:o|ó)i|d(?:i|ị)ch|dich|dick|dict|dik)\b/giu,
+function stripTrailingKnownCommand(text = '') {
+  let output = String(text);
+  for (const item of TRAILING_COMMANDS) {
+    const match = item.regex.exec(output);
+    if (!match) continue;
+    output = output.slice(0, match.index).trim();
+    return cleanSourceText(output);
+  }
+
+  // Normalized fallback: remove only an end command. Never remove a phrase from
+  // the middle of ordinary content, which prevents accidental app activation.
+  const normalized = normalizeForCommand(output);
+  const hit = trailingNormalizedCommand(normalized);
+  if (!hit) return cleanSourceText(output);
+
+  // Text fallback cannot safely map normalized character positions back to the
+  // original string. Use a conservative raw suffix matcher for known STT forms.
+  return cleanSourceText(output.replace(
+    /(?:^|[\s.!?…,:;\-–—])mi\s*mi\s*[,.:;\-–—]?\s*(?:n(?:o|ó)i|d(?:i|ị)ch|dich|dick|dict|dik)\s*[.!?…,:;\-–—]*\s*$/iu,
     ' ',
   ));
 }
@@ -50,33 +68,14 @@ function stripKnownCommandAnywhere(text = '') {
 export function detectMimiCommand(text = '') {
   const original = String(text);
 
-  for (const item of COMMAND_PATTERNS) {
+  for (const item of TRAILING_COMMANDS) {
     const match = item.regex.exec(original);
     if (match) {
       return {
         type: item.type,
         index: match.index,
-        matchedText: match[0],
-        sourceText: removeCommandAnywhere(original, item.regex),
-      };
-    }
-  }
-
-  // Fallback for STT that drops Vietnamese accents, inserts unusual spacing,
-  // or hears "dịch" as an English-looking "dick/dict/dik" token.
-  const normalized = normalizeForCommand(original);
-  const candidates = [
-    { type: 'SPEAK', phrases: ['mimi noi', 'mi mi noi'] },
-    { type: 'TRANSLATE', phrases: ['mimi dich', 'mi mi dich', 'mimi dick', 'mi mi dick', 'mimi dict', 'mi mi dict', 'mimi dik', 'mi mi dik'] },
-  ];
-
-  for (const candidate of candidates) {
-    if (candidate.phrases.some((phrase) => normalized.includes(phrase))) {
-      return {
-        type: candidate.type,
-        index: -1,
-        matchedText: '',
-        sourceText: stripKnownCommandAnywhere(original),
+        matchedText: match[0].trim(),
+        sourceText: cleanSourceText(original.slice(0, match.index)),
       };
     }
   }
@@ -84,9 +83,10 @@ export function detectMimiCommand(text = '') {
   return null;
 }
 
-// Kept for backward compatibility with tests/imports from older builds.
+// Used after an audio command has already been positively confirmed. Still only
+// strips a trailing command so ordinary discussion containing "Mimi dịch" is kept.
 export function stripCommandFallback(text = '') {
-  return stripKnownCommandAnywhere(text);
+  return stripTrailingKnownCommand(text);
 }
 
 export function mergeTranscript(buffer = '', incoming = '', lastChunk = '') {

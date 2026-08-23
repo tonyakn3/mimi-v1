@@ -121,6 +121,8 @@ const state = {
   currentSide: 1,
   activeCommandType: null,
   commandProbeCount: 0,
+  commandProbeBusy: false,
+  queuedCommandProbe: null,
   commandResolving: false,
   turnAudioChunks: [],
   turnAudioBytes: 0,
@@ -239,14 +241,10 @@ LANGUAGE PAIR
 - Person 2 language: ${l2.name} (${l2.code})
 
 CRITICAL COMMAND + TRANSPORT RULE
-- Live microphone audio is primarily listening/transcription context. NEVER speak, answer, acknowledge, translate, or react to ordinary live microphone audio by itself.
-- You have exactly two command tools: mimi_speak and mimi_translate.
-- If you hear the Vietnamese control phrase "Mimi nói", call mimi_speak immediately and put the complete Person 1 utterance immediately before the command into source_text.
-- If you hear the Vietnamese control phrase "Mimi dịch", call mimi_translate immediately and put the complete Person 2 utterance immediately before the command into source_text.
-- The phrase "Mimi dịch" is ALWAYS a Vietnamese app command even if the active speaker just spoke Chinese or another language. Give these two command phrases special priority and do not force them into the active conversation language.
-- Do not call a command tool merely because someone discusses the words as content; call it when the phrase is clearly used as the app control command.
-- After a command tool call, the client will send a tool response. Do NOT speak after the tool response. Wait for the private internal text instruction beginning exactly with [MIMI_EXECUTE].
-- ONLY when [MIMI_EXECUTE] arrives may you produce spoken audio.
+- Live microphone audio is listening/transcription context only. NEVER speak, answer, acknowledge, translate, or react to ordinary live microphone audio by itself.
+- The client has a separate state-locked wake-word command engine. It recognizes only a final standalone control phrase: wake word "Mimi" + the expected intent word ("nói" on Person 1 turn, "dịch" on Person 2 turn).
+- Do not treat ordinary sentences that merely mention Mimi, nói, or dịch as commands.
+- ONLY when the private internal text instruction begins exactly with [MIMI_EXECUTE] may you produce spoken audio.
 - When you do speak, output ONLY the translated utterance. No introduction, no explanation, no quotation marks, no "Mimi says", no extra comment.
 
 INTERPRETING RULES
@@ -265,7 +263,7 @@ INTERPRETING RULES
 COMMAND SEMANTICS USED BY THE APP
 - "Mimi nói" means Person 1 -> Person 2.
 - "Mimi dịch" means Person 2 -> Person 1.
-The client also has an independent audio command detector as a fallback. If you hear either command, call the matching command tool, but never speak directly from the command audio. Spoken output is allowed only after [MIMI_EXECUTE].
+The command engine is client-controlled and state-locked. Spoken output is allowed only after [MIMI_EXECUTE].
 `.trim();
 }
 
@@ -318,11 +316,13 @@ function sendAudio(base64Pcm) {
 
 async function classifyCommandAudio(pcmBytes, sampleRate = 16000, expected = expectedCommandType()) {
   const bytes = pcmBytes instanceof Uint8Array ? pcmBytes : new Uint8Array(pcmBytes);
-  if (bytes.byteLength < 1000) return 'NONE';
+  if (bytes.byteLength < 1000) {
+    return { command: 'NONE', wakeDetected: false, intentDetected: false };
+  }
 
-  // The fixed command is at the end of a short utterance. Give slow/natural
-  // Vietnamese up to 4.8 seconds so “Mimi dịch” is not clipped on iPhone.
-  const maxBytes = Math.floor(sampleRate * 2 * 4.8);
+  // V1.8: wake-word + intent detector. The server evaluates "Mimi" and the
+  // state-locked final word separately and rejects speech that continues after it.
+  const maxBytes = Math.floor(sampleRate * 2 * 5.2);
   const tail = bytes.byteLength > maxBytes ? bytes.subarray(bytes.byteLength - maxBytes) : bytes;
 
   const response = await fetch(COMMAND_DETECT_ENDPOINT, {
@@ -338,7 +338,14 @@ async function classifyCommandAudio(pcmBytes, sampleRate = 16000, expected = exp
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || 'Command detector không phản hồi.');
-  return data.command === expected ? expected : 'NONE';
+  return {
+    command: data.command === expected ? expected : 'NONE',
+    wakeDetected: Boolean(data.wakeDetected),
+    intentDetected: Boolean(data.intentDetected),
+    speechAfterIntent: Boolean(data.speechAfterIntent),
+    boundaryBeforeWake: Boolean(data.boundaryBeforeWake),
+    isolatedCommand: Boolean(data.isolatedCommand),
+  };
 }
 
 async function resolveCurrentTurnAudio(type, sampleRate = 16000) {
@@ -376,7 +383,7 @@ async function executeOrPendDetectedCommand(type, label = commandLabel(type)) {
   setStatus('translating', `Đã nhận lệnh “${label}”`);
 
   try {
-    // V1.7: recover source from the actual PCM of the whole current turn first.
+    // V1.8: recover source from the actual PCM of the whole current turn after the command is confirmed.
     // This makes Person 2 -> Person 1 independent of Live transcription order.
     let sourceText = '';
     try {
@@ -404,20 +411,70 @@ async function executeOrPendDetectedCommand(type, label = commandLabel(type)) {
   }
 }
 
-async function probeAudioForCommand(pcmBytes, sampleRate = 16000) {
-  if (!state.running || state.playGate || state.commandResolving || state.commandProbeCount >= 1) return;
-  const expected = expectedCommandType();
-  state.commandProbeCount += 1;
+async function runQueuedCommandProbe() {
+  if (state.commandProbeBusy || !state.queuedCommandProbe || !state.running || state.playGate) return;
+
+  const probe = state.queuedCommandProbe;
+  state.queuedCommandProbe = null;
+  state.commandProbeBusy = true;
+  state.commandProbeCount = 1;
+
   try {
-    const command = await classifyCommandAudio(pcmBytes, sampleRate, expected);
-    if (!state.running || state.playGate || command !== expected) return;
-    await executeOrPendDetectedCommand(expected, commandLabel(expected));
+    // State may have changed while an earlier probe was being processed. Never
+    // allow a command from the wrong conversation side to execute.
+    if (probe.expected !== expectedCommandType()) return;
+
+    const result = await classifyCommandAudio(probe.pcmBytes, probe.sampleRate, probe.expected);
+    if (!state.running || state.playGate || probe.expected !== expectedCommandType()) return;
+
+    if (result.command === probe.expected) {
+      setStatus('listening', `Đã nghe “Mimi” → lệnh “${probe.expected === 'TRANSLATE' ? 'dịch' : 'nói'}”`);
+      await executeOrPendDetectedCommand(probe.expected, commandLabel(probe.expected));
+      return;
+    }
+
+    // Diagnostic feedback: this tells us whether iPhone/Gemini heard the wake
+    // word but missed the final intent, without ever executing a partial command.
+    if (result.wakeDetected) {
+      const intent = probe.expected === 'TRANSLATE' ? 'dịch' : 'nói';
+      if (!result.intentDetected) {
+        setStatus('listening', `Đã nghe “Mimi” · chưa nghe rõ “${intent}”`);
+      } else if (result.speechAfterIntent) {
+        setStatus('listening', `Nghe thấy “Mimi ${intent}” nhưng còn lời phía sau · không kích hoạt`);
+      } else {
+        setStatus('listening', `Nghe thấy “Mimi ${intent}” nhưng chưa đủ điều kiện lệnh`);
+      }
+    }
   } catch (error) {
-    // Live transcription + function calling remain fallback paths.
-    console.warn('Audio command detector:', error);
+    console.warn('Wake/intent command detector:', error);
   } finally {
-    state.commandProbeCount = Math.max(0, state.commandProbeCount - 1);
+    state.commandProbeBusy = false;
+    state.commandProbeCount = 0;
+    // If a newer utterance arrived while this request was in flight, process it
+    // immediately instead of dropping it. This fixes the V1.7 race where the
+    // Chinese source probe could make the following "Mimi dịch" disappear.
+    if (state.queuedCommandProbe) queueMicrotask(() => runQueuedCommandProbe());
   }
+}
+
+function probeAudioForCommand(pcmBytes, sampleRate = 16000) {
+  if (!state.running || state.playGate || state.commandResolving) return;
+  const bytes = pcmBytes instanceof Uint8Array ? pcmBytes : new Uint8Array(pcmBytes);
+  if (bytes.byteLength < 1000) return;
+
+  const durationSeconds = bytes.byteLength / (sampleRate * 2);
+  // A control phrase is short. Long source turns are already stored in the turn
+  // buffer and transcribed by Live; skipping them prevents a slow detector call
+  // from blocking the short command that follows.
+  if (durationSeconds > 6.2) return;
+
+  const expected = expectedCommandType();
+  const copy = bytes.slice();
+
+  // Keep the NEWEST utterance while a detector request is busy. In normal use the
+  // newest short utterance after a source sentence is exactly "Mimi nói/dịch".
+  state.queuedCommandProbe = { pcmBytes: copy, sampleRate, expected, at: Date.now() };
+  runQueuedCommandProbe();
 }
 
 function maybeFulfillPendingCommand() {
@@ -481,7 +538,6 @@ async function connectGemini() {
           systemInstruction: {
             parts: [{ text: buildSystemInstruction() }],
           },
-          tools: COMMAND_TOOLS,
           realtimeInputConfig: {
             automaticActivityDetection: {
               disabled: false,
@@ -510,10 +566,6 @@ async function connectGemini() {
           settled = true;
           resolve();
           return;
-        }
-
-        if (response.toolCall) {
-          await handleToolCall(response.toolCall);
         }
 
         await handleServerMessage(response);
@@ -830,9 +882,10 @@ async function startMimi() {
         state.localSpeechActive = false;
         flushAudioTurnFast();
       },
-      // Independent command path: send the just-finished mic utterance to a tiny
-      // audio classifier. This does NOT depend on Live transcription, so
-      // "Mimi dịch" still works after a Chinese turn on iPhone Safari.
+      // V1.8 authoritative command path: each finished short utterance goes to a
+      // state-locked wake-word + intent detector. A busy detector keeps the newest
+      // utterance queued, so the final "Mimi dịch" can never be dropped behind the
+      // preceding Chinese source sentence.
       onUtterancePcm: (pcmBytes, sampleRate) => {
         probeAudioForCommand(pcmBytes, sampleRate);
       },
@@ -852,6 +905,8 @@ async function startMimi() {
     state.pendingCommand = null;
     state.activeCommandType = null;
     state.commandProbeCount = 0;
+    state.commandProbeBusy = false;
+    state.queuedCommandProbe = null;
     state.commandResolving = false;
     clearTurnAudio();
     state.currentSide = 1;
@@ -880,6 +935,8 @@ async function stopMimi({ keepError = false } = {}) {
   state.pendingCommand = null;
   state.activeCommandType = null;
   state.commandProbeCount = 0;
+  state.commandProbeBusy = false;
+  state.queuedCommandProbe = null;
   state.commandResolving = false;
   clearTurnAudio();
   state.currentSide = 1;

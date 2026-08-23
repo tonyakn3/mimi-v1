@@ -166,11 +166,11 @@ export class MicrophoneCapture {
         let endedNow = false;
 
         if (speaking) {
-          this.speechHangoverUntil = now + 500;
+          this.speechHangoverUntil = now + 380;
           if (!this.speechActive) {
             this.speechActive = true;
             startedNow = true;
-            // Preserve ~300 ms before speech start so "Mimi" is not clipped.
+            // Preserve ~340 ms before speech start so the wake word "Mimi" is not clipped.
             this.utteranceChunks = this.preRollChunks.map((chunk) => chunk.slice());
             this.onSpeechStart?.();
           }
@@ -211,7 +211,7 @@ export class MicrophoneCapture {
         }
 
         // Keep an exact PCM copy in the app's current-turn ring buffer. This is
-        // the V1.7 fallback that lets us recover Person 2's source even when Live
+        // the turn-audio fallback that lets us recover Person 2's source even when Live
         // transcription returns late or misses the Vietnamese command.
         this.onPcmBytes?.(pcmBytes);
 
