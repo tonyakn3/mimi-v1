@@ -296,14 +296,22 @@ async function connectGemini() {
   const url = `${WS_ENDPOINT}?access_token=${encodeURIComponent(token)}`;
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url); state.ws = ws; let settled = false;
-    const fail = (error) => { if (!settled) { settled = true; reject(error instanceof Error ? error : new Error(String(error))); } };
+    const setupTimer = setTimeout(() => fail(new Error('Gemini Live không trả setupComplete sau 10 giây.')), 10000);
+    const fail = (error) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(setupTimer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
     ws.onopen = () => {
+      // Raw Live WebSocket setup follows the current v1beta wire format.
+      // responseModalities / speechConfig belong directly in setup (not nested
+      // under generationConfig) when using the raw BidiGenerateContent socket.
       ws.send(JSON.stringify({ setup: {
         model: `models/${MODEL}`,
-        generationConfig: {
-          responseModalities: ['AUDIO'],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE_NAME } } },
-        },
+        responseModalities: ['AUDIO'],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE_NAME } } },
         systemInstruction: { parts: [{ text: buildSystemInstruction() }] },
         realtimeInputConfig: { automaticActivityDetection: { disabled: false, startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH', endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH', prefixPaddingMs: 100, silenceDurationMs: 520 } },
         inputAudioTranscription: {}, outputAudioTranscription: {},
@@ -313,7 +321,17 @@ async function connectGemini() {
       try {
         const raw = typeof event.data === 'string' ? event.data : await event.data.text();
         const response = JSON.parse(raw);
-        if (response.setupComplete && !settled) { settled = true; resolve(); return; }
+        if (response.error) {
+          const msg = response.error.message || response.error.status || 'Gemini Live setup lỗi.';
+          fail(new Error(msg));
+          return;
+        }
+        if (response.setupComplete && !settled) {
+          settled = true;
+          clearTimeout(setupTimer);
+          resolve();
+          return;
+        }
         await handleServerMessage(response);
       } catch (error) { console.error('Live message:', error); }
     };

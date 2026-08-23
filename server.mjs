@@ -135,7 +135,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     if (url.pathname === '/api/health' && req.method === 'GET') {
-      return json(res, 200, { ok: true, version: '2.1.0', apiKeyConfigured: Boolean(GEMINI_API_KEY), liveModel: LIVE_MODEL, commandModel: COMMAND_MODEL });
+      return json(res, 200, { ok: true, version: '2.1.1', apiKeyConfigured: Boolean(GEMINI_API_KEY), liveModel: LIVE_MODEL, commandModel: COMMAND_MODEL });
     }
     if (url.pathname.startsWith('/api/') && !originAllowed(req)) return json(res, 403, { error: 'Origin không được phép.' });
     if (url.pathname.startsWith('/api/') && !GEMINI_API_KEY) return json(res, 503, { error: 'Backend chưa có GEMINI_API_KEY.' });
@@ -166,7 +166,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Mimi V2.1 Hot Live đang chạy tại http://localhost:${PORT}`);
+  console.log(`Mimi V2.1.1 Hot Live đang chạy tại http://localhost:${PORT}`);
   console.log(`Gemini API key: ${GEMINI_API_KEY ? 'đã cấu hình' : 'CHƯA cấu hình'}`);
   console.log(`Live model: ${LIVE_MODEL} | Command fallback: ${COMMAND_MODEL}`);
 });

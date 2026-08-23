@@ -1,4 +1,4 @@
-const CACHE = 'mimi-v2-1-hot-live-2026-08-24-001';
+const CACHE = 'mimi-v2-1-1-live-setup-fix-2026-08-24-001';
 const APP_SHELL = ['./', './index.html', './styles.css', './manifest.webmanifest', './js/app.js', './js/audio.js', './js/commands.js', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 self.addEventListener('install', (event) => { event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(APP_SHELL))); self.skipWaiting(); });
 self.addEventListener('activate', (event) => { event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))); self.clients.claim(); });

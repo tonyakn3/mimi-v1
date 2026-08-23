@@ -1,9 +1,9 @@
 {
   "name": "mimi-hot-live-interpreter",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": true,
   "type": "module",
-  "description": "Mimi V2.1 - hot Gemini Live session, per-turn local reset, Safari/iPhone voice interpreter.",
+  "description": "Mimi V2.1.1 - current raw Gemini Live WebSocket setup, per-turn local reset, Safari/iPhone voice interpreter.",
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test",
