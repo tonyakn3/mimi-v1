@@ -1,9 +1,9 @@
 {
-  "name": "mimi-reset-loop-interpreter",
-  "version": "2.0.0",
+  "name": "mimi-hot-live-interpreter",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
-  "description": "Mimi V2.0 - stateless two-person interpreter for Safari/iPhone. Commands: Mimi nói / dịch lại. Hard reset after every translated turn.",
+  "description": "Mimi V2.1 - hot Gemini Live session, per-turn local reset, Safari/iPhone voice interpreter.",
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test",
