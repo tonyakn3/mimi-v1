@@ -1,9 +1,10 @@
 import { detectMimiCommand, mergeTranscript, stripCommandFallback } from './commands.js';
-import { MicrophoneCapture, PcmOutputPlayer } from './audio.js';
+import { MicrophoneCapture, PcmOutputPlayer, bytesToBase64 } from './audio.js';
 
 const MODEL = 'gemini-3.1-flash-live-preview';
 const VOICE_NAME = 'Kore';
 const TOKEN_ENDPOINT = '/api/live-token';
+const COMMAND_DETECT_ENDPOINT = '/api/detect-command';
 const WS_ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
 
 const LANGUAGES = [
@@ -117,6 +118,7 @@ const state = {
   lastAudioFlushAt: 0,
   currentSide: 1,
   activeCommandType: null,
+  commandProbeCount: 0,
 };
 
 function languageByCode(code) {
@@ -219,7 +221,7 @@ INTERPRETING RULES
 COMMAND SEMANTICS USED BY THE APP
 - "Mimi nói" means Person 1 -> Person 2.
 - "Mimi dịch" means Person 2 -> Person 1.
-The app detects these commands and sends you [MIMI_EXECUTE]; do not execute directly from hearing the command in live audio.
+The client also has an independent audio command detector as a fallback. If you hear either command, call the matching command tool, but never speak directly from the command audio. Spoken output is allowed only after [MIMI_EXECUTE].
 `.trim();
 }
 
@@ -267,6 +269,114 @@ function sendAudio(base64Pcm) {
       },
     },
   });
+}
+
+
+async function classifyCommandAudio(pcmBytes, sampleRate = 16000) {
+  const bytes = pcmBytes instanceof Uint8Array ? pcmBytes : new Uint8Array(pcmBytes);
+  if (bytes.byteLength < 1600) return 'NONE';
+
+  // Only the tail matters because the voice command is spoken at the end.
+  // Keeping this short also avoids uploading a long partner utterance to the
+  // command-classifier endpoint.
+  const maxBytes = Math.floor(sampleRate * 2 * 3.4);
+  const tail = bytes.byteLength > maxBytes ? bytes.subarray(bytes.byteLength - maxBytes) : bytes;
+
+  const response = await fetch(COMMAND_DETECT_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    cache: 'no-store',
+    body: JSON.stringify({
+      audio: bytesToBase64(tail),
+      sampleRate,
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || 'Command detector không phản hồi.');
+  return ['SPEAK', 'TRANSLATE'].includes(data.command) ? data.command : 'NONE';
+}
+
+async function executeOrPendDetectedCommand(type, label) {
+  if (!state.running || state.playGate) return;
+
+  const now = Date.now();
+  if (now - state.lastCommandAt < 850) return;
+
+  setStatus('translating', `Đã nhận lệnh “${label}”`);
+
+  // Input transcription can arrive a little after the raw audio command detector.
+  // Give it a short window so the source sentence (especially Chinese) is preserved.
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  if (!state.running || state.playGate) return;
+
+  let sourceText = stripCommandFallback(state.transcriptBuffer).trim();
+  if (!sourceText) {
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    sourceText = stripCommandFallback(state.transcriptBuffer).trim();
+  }
+
+  if (!sourceText) {
+    state.pendingCommand = { type, at: Date.now(), detector: 'audio' };
+    setStatus('listening', `Đã nghe “${label}” · đang chốt câu...`);
+    return;
+  }
+
+  state.pendingCommand = null;
+  state.lastCommandAt = Date.now();
+  executeTranslation(type, sourceText).catch((error) => {
+    console.error(error);
+    recoverFromTranslationError(error.message || 'Không dịch được.');
+  });
+}
+
+async function probeAudioForCommand(pcmBytes, sampleRate = 16000) {
+  if (!state.running || state.playGate || state.commandProbeCount >= 2) return;
+  state.commandProbeCount += 1;
+  try {
+    const command = await classifyCommandAudio(pcmBytes, sampleRate);
+    if (!state.running || state.playGate || command === 'NONE') return;
+
+    if (command === 'SPEAK') {
+      await executeOrPendDetectedCommand('SPEAK', 'Mimi nói');
+    } else if (command === 'TRANSLATE') {
+      await executeOrPendDetectedCommand('TRANSLATE', 'Mimi dịch');
+    }
+  } catch (error) {
+    // This is a fallback detector. Live transcription/tool calling keeps working
+    // even if the classifier temporarily hits a quota/network error.
+    console.warn('Audio command detector:', error);
+  } finally {
+    state.commandProbeCount = Math.max(0, state.commandProbeCount - 1);
+  }
+}
+
+function maybeFulfillPendingCommand() {
+  if (!state.pendingCommand || state.playGate || !state.running) return false;
+
+  const now = Date.now();
+  if (now - state.pendingCommand.at > 3200) {
+    state.pendingCommand = null;
+    return false;
+  }
+
+  const sourceText = stripCommandFallback(state.transcriptBuffer).trim();
+  if (!sourceText) return false;
+
+  const pending = state.pendingCommand;
+  state.pendingCommand = null;
+  if (now - state.lastCommandAt < 700) return false;
+
+  state.lastCommandAt = now;
+  setStatus('translating', pending.type === 'SPEAK'
+    ? 'Đã nhận lệnh “Mimi nói”'
+    : 'Đã nhận lệnh “Mimi dịch”');
+
+  executeTranslation(pending.type, sourceText).catch((error) => {
+    console.error(error);
+    recoverFromTranslationError(error.message || 'Không dịch được.');
+  });
+  return true;
 }
 
 async function connectGemini() {
@@ -445,7 +555,7 @@ async function handleServerMessage(response) {
     const heard = compactTranscript(state.transcriptBuffer);
     if (heard) setStatus('listening', `Mimi nghe: ${heard}`);
 
-    maybeHandleCommand();
+    if (!maybeFulfillPendingCommand()) maybeHandleCommand();
   }
 
   if (content.outputTranscription?.text && state.playGate) {
@@ -634,6 +744,12 @@ async function startMimi() {
         state.localSpeechActive = false;
         flushAudioTurnFast();
       },
+      // Independent command path: send the just-finished mic utterance to a tiny
+      // audio classifier. This does NOT depend on Live transcription, so
+      // "Mimi dịch" still works after a Chinese turn on iPhone Safari.
+      onUtterancePcm: (pcmBytes, sampleRate) => {
+        probeAudioForCommand(pcmBytes, sampleRate);
+      },
       onError: (error) => console.error('Mic processing:', error),
     });
 
@@ -649,6 +765,7 @@ async function startMimi() {
     state.lastAudioFlushAt = 0;
     state.pendingCommand = null;
     state.activeCommandType = null;
+    state.commandProbeCount = 0;
     state.currentSide = 1;
     els.startBtn.disabled = false;
     els.startLabel.textContent = 'KẾT THÚC';
@@ -674,6 +791,7 @@ async function stopMimi({ keepError = false } = {}) {
   state.outputTranscript = '';
   state.pendingCommand = null;
   state.activeCommandType = null;
+  state.commandProbeCount = 0;
   state.currentSide = 1;
 
   try {

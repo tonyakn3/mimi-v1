@@ -9,6 +9,7 @@ const PORT = Number(process.env.PORT || 3000);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const PUBLIC_ORIGIN = (process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '');
 const ALLOWED_MODEL = 'gemini-3.1-flash-live-preview';
+const COMMAND_MODEL = 'gemini-3.1-flash-lite';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -23,8 +24,10 @@ const MIME = {
 };
 
 const recentRequests = new Map();
+const recentCommandRequests = new Map();
 const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 24;
+const COMMAND_RATE_LIMIT = 120;
 
 function securityHeaders(extra = {}) {
   return {
@@ -73,6 +76,99 @@ function rateLimited(req) {
   list.push(now);
   recentRequests.set(ip, list);
   return false;
+}
+
+function commandRateLimited(req) {
+  const ip = getClientIp(req);
+  const now = Date.now();
+  const list = (recentCommandRequests.get(ip) || []).filter((time) => now - time < RATE_WINDOW_MS);
+  if (list.length >= COMMAND_RATE_LIMIT) return true;
+  list.push(now);
+  recentCommandRequests.set(ip, list);
+  return false;
+}
+
+function pcm16ToWav(pcmBuffer, sampleRate = 16000) {
+  const dataLength = pcmBuffer.length;
+  const wav = Buffer.alloc(44 + dataLength);
+  wav.write('RIFF', 0);
+  wav.writeUInt32LE(36 + dataLength, 4);
+  wav.write('WAVE', 8);
+  wav.write('fmt ', 12);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * 2, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write('data', 36);
+  wav.writeUInt32LE(dataLength, 40);
+  pcmBuffer.copy(wav, 44);
+  return wav;
+}
+
+async function detectCommandFromPcm(base64Pcm, sampleRate = 16000) {
+  const raw = Buffer.from(base64Pcm, 'base64');
+  if (raw.length < 1600) return 'NONE';
+
+  // The wake phrase is always at the end. Keep only the last ~3.2 seconds so
+  // detection stays fast even when the source utterance was long.
+  const maxBytes = Math.floor(sampleRate * 2 * 3.2);
+  const tail = raw.length > maxBytes ? raw.subarray(raw.length - maxBytes) : raw;
+  const wav = pcm16ToWav(tail, sampleRate);
+
+  const prompt = [
+    'You are a strict Vietnamese voice-command recognizer for an interpreter app named Mimi.',
+    'Listen to the END of this short audio.',
+    'Output exactly one token and nothing else:',
+    'SPEAK = the speaker clearly says the Vietnamese command "Mimi nói".',
+    'TRANSLATE = the speaker clearly says the Vietnamese command "Mimi dịch".',
+    'NONE = neither command is clearly spoken.',
+    'Audio before the command may be Chinese or another language.',
+    'Do not translate. Do not infer a command from context.',
+    'Recognize natural Vietnamese pronunciation and mild background noise.'
+  ].join('\n');
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${COMMAND_MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': GEMINI_API_KEY,
+      },
+      body: JSON.stringify({
+        contents: [{
+          role: 'user',
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: 'audio/wav', data: wav.toString('base64') } },
+          ],
+        }],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: 8,
+        },
+      }),
+    },
+  );
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const details = data?.error?.message || `Gemini command classifier HTTP ${response.status}`;
+    throw new Error(details);
+  }
+
+  const text = (data?.candidates?.[0]?.content?.parts || [])
+    .map((part) => part?.text || '')
+    .join(' ')
+    .trim()
+    .toUpperCase();
+
+  if (text.includes('TRANSLATE')) return 'TRANSLATE';
+  if (text.includes('SPEAK')) return 'SPEAK';
+  return 'NONE';
 }
 
 function originAllowed(req) {
@@ -177,6 +273,37 @@ const server = http.createServer(async (req, res) => {
         apiKeyConfigured: Boolean(GEMINI_API_KEY),
         model: ALLOWED_MODEL,
       });
+      return;
+    }
+
+    if (url.pathname === '/api/detect-command' && req.method === 'POST') {
+      if (!originAllowed(req)) {
+        json(res, 403, { error: 'Origin không được phép.' });
+        return;
+      }
+      if (commandRateLimited(req)) {
+        json(res, 429, { error: 'Command detector đang nhận quá nhiều yêu cầu.' });
+        return;
+      }
+      if (!GEMINI_API_KEY) {
+        json(res, 503, { error: 'Backend chưa có GEMINI_API_KEY.' });
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req, 700_000);
+        const audio = String(body.audio || '');
+        const sampleRate = Number(body.sampleRate || 16000);
+        if (!audio || !Number.isFinite(sampleRate) || sampleRate < 8000 || sampleRate > 48000) {
+          json(res, 400, { error: 'Audio command không hợp lệ.' });
+          return;
+        }
+        const command = await detectCommandFromPcm(audio, sampleRate);
+        json(res, 200, { command });
+      } catch (error) {
+        console.error('Command detector error:', error.message);
+        json(res, 502, { error: `Không nhận diện được câu lệnh: ${error.message}` });
+      }
       return;
     }
 
