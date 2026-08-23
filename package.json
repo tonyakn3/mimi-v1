@@ -1,9 +1,9 @@
 {
   "name": "mimi-live-interpreter",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": true,
   "type": "module",
-  "description": "Mimi V1.7 - Safari/iPhone PWA voice interpreter with robust two-way Vietnamese command detection",
+  "description": "Mimi V1.7.1 - Safari/iPhone PWA voice interpreter with robust two-way Vietnamese command detection",
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test",
