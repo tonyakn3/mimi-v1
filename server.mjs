@@ -95,7 +95,7 @@ async function detectCommand(pcm, sampleRate, expected) {
     generationConfig: {
       responseMimeType: 'application/json', responseSchema: {
         type: 'OBJECT', properties: { commandDetected: { type: 'BOOLEAN' }, heardText: { type: 'STRING' } },
-        required: ['commandDetected', 'heardText'], additionalProperties: false,
+        required: ['commandDetected', 'heardText'],
       },
     },
   });
@@ -125,7 +125,7 @@ async function translateTurn({ pcm, sampleRate, commandPhrase: phrase, sourceLan
       responseMimeType: 'application/json', responseSchema: {
         type: 'OBJECT', properties: {
           sourceText: { type: 'STRING' }, translationText: { type: 'STRING' }, unclearCritical: { type: 'BOOLEAN' },
-        }, required: ['sourceText', 'translationText', 'unclearCritical'], additionalProperties: false,
+        }, required: ['sourceText', 'translationText', 'unclearCritical'],
       },
     },
   });
@@ -172,7 +172,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     if (url.pathname === '/api/health' && req.method === 'GET') {
-      json(res, 200, { ok: true, version: '2.0.0', apiKeyConfigured: Boolean(GEMINI_API_KEY), commandModel: COMMAND_MODEL, translateModel: TRANSLATE_MODEL, ttsModel: TTS_MODEL }); return;
+      json(res, 200, { ok: true, version: '2.0.1', apiKeyConfigured: Boolean(GEMINI_API_KEY), commandModel: COMMAND_MODEL, translateModel: TRANSLATE_MODEL, ttsModel: TTS_MODEL }); return;
     }
     if (url.pathname.startsWith('/api/') && !originAllowed(req)) { json(res, 403, { error: 'Origin không được phép.' }); return; }
     if (url.pathname.startsWith('/api/') && !GEMINI_API_KEY) { json(res, 503, { error: 'Backend chưa có GEMINI_API_KEY.' }); return; }
@@ -210,7 +210,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Mimi V2.0 Reset Loop đang chạy tại http://localhost:${PORT}`);
+  console.log(`Mimi V2.0.1 Schema Fix đang chạy tại http://localhost:${PORT}`);
   console.log(`Gemini API key: ${GEMINI_API_KEY ? 'đã cấu hình' : 'CHƯA cấu hình'}`);
   console.log(`Models: command=${COMMAND_MODEL}, translate=${TRANSLATE_MODEL}, tts=${TTS_MODEL}`);
 });
