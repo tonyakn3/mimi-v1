@@ -1,4 +1,4 @@
-const CACHE = 'mimi-v1-7-1-voice-fix-2026-08-24';
+const CACHE = 'mimi-v1-7-reverse-rebuild-2026-08-23-2345';
 const APP_SHELL = [
   './',
   './index.html',

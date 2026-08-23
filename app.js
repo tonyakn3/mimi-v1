@@ -470,16 +470,14 @@ async function connectGemini() {
       const setupMessage = {
         setup: {
           model: `models/${MODEL}`,
-          // Raw Gemini Live WebSocket config: audio output and voice belong
-          // directly under setup. Keeping them under generationConfig can
-          // leave the session without native audio output.
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: VOICE_NAME },
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: VOICE_NAME },
+              },
             },
           },
-          thinkingConfig: { thinkingLevel: 'minimal' },
           systemInstruction: {
             parts: [{ text: buildSystemInstruction() }],
           },
@@ -507,16 +505,6 @@ async function connectGemini() {
       try {
         const raw = typeof event.data === 'string' ? event.data : await event.data.text();
         const response = JSON.parse(raw);
-
-        if (response.error) {
-          const message = response.error.message || response.error.status || 'Gemini Live báo lỗi.';
-          fail(new Error(message));
-          if (state.running) {
-            setStatus('error', 'Gemini Live lỗi');
-            showError(message);
-          }
-          return;
-        }
 
         if (response.setupComplete && !settled) {
           settled = true;
@@ -651,9 +639,7 @@ async function handleServerMessage(response) {
   }
 
   if (content.outputTranscription?.text && state.playGate) {
-    // Transcript alone is not proof that audible PCM arrived. Only mark the
-    // turn as having audio when inlineData is received, otherwise Safari can
-    // falsely finish a silent turn.
+    state.translationHasOutput = true;
     state.outputTranscript += content.outputTranscription.text;
   }
 

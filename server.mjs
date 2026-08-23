@@ -237,6 +237,7 @@ async function resolveTurnFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPE
           sourceText: { type: 'STRING' },
         },
         required: ['commandDetected', 'sourceText'],
+        additionalProperties: false,
       },
     },
   });
@@ -329,7 +330,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/health' && req.method === 'GET') {
       json(res, 200, {
         ok: true,
-        version: '1.7.1',
+        version: '1.7.0',
         apiKeyConfigured: Boolean(GEMINI_API_KEY),
         liveModel: LIVE_MODEL,
         commandModel: COMMAND_MODEL,
