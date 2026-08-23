@@ -1,4 +1,4 @@
-const CACHE = 'mimi-v1-3-fast-command-2026-08-23-2233';
+const CACHE = 'mimi-v1-5-command-tool-2026-08-23-2245';
 const APP_SHELL = [
   './',
   './index.html',

@@ -1,4 +1,4 @@
-import { detectMimiCommand, mergeTranscript } from './commands.js';
+import { detectMimiCommand, mergeTranscript, stripCommandFallback } from './commands.js';
 import { MicrophoneCapture, PcmOutputPlayer } from './audio.js';
 
 const MODEL = 'gemini-3.1-flash-live-preview';
@@ -43,6 +43,42 @@ const LED_GLOSSARY = [
   'SMD', 'COB', 'GOB', 'driver IC', 'power supply', 'front maintenance', 'rear maintenance', 'indoor', 'outdoor', 'rental screen',
   'fixed installation', 'NovaStar', 'Nova', 'Colorlight', 'Huidu', '3840Hz', '7680Hz', 'ICN2053', 'ICND', 'Nationstar', 'Kinglight'
 ];
+
+const COMMAND_TOOLS = [{
+  functionDeclarations: [
+    {
+      name: 'mimi_speak',
+      description: 'Call this function ONLY when the user clearly says the Vietnamese control phrase "Mimi nói". This means translate Person 1 to Person 2. Put the complete source utterance immediately before the command into source_text, excluding the words "Mimi nói". Do not call this for ordinary conversation that merely mentions Mimi.',
+      parametersJsonSchema: {
+        type: 'object',
+        properties: {
+          source_text: {
+            type: 'string',
+            description: 'Complete Person 1 utterance immediately preceding the command, excluding the command itself.'
+          }
+        },
+        required: ['source_text'],
+        additionalProperties: false
+      }
+    },
+    {
+      name: 'mimi_translate',
+      description: 'Call this function ONLY when the user clearly says the Vietnamese control phrase "Mimi dịch". This means translate Person 2 to Person 1. Put the complete source utterance immediately before the command into source_text, excluding the words "Mimi dịch". This command must be recognized even while the conversation language is Chinese or another non-Vietnamese language.',
+      parametersJsonSchema: {
+        type: 'object',
+        properties: {
+          source_text: {
+            type: 'string',
+            description: 'Complete Person 2 utterance immediately preceding the command, excluding the command itself.'
+          }
+        },
+        required: ['source_text'],
+        additionalProperties: false
+      }
+    }
+  ]
+}];
+
 
 const els = {
   lang1: document.querySelector('#lang1'),
@@ -156,11 +192,15 @@ LANGUAGE PAIR
 - Person 1 language: ${l1.name} (${l1.code})
 - Person 2 language: ${l2.name} (${l2.code})
 
-CRITICAL TRANSPORT RULE
-- Live microphone audio is listening/transcription context only.
-- NEVER speak, answer, acknowledge, translate, or react to ordinary live microphone audio by itself.
-- The client will send a private internal text instruction beginning exactly with [MIMI_EXECUTE].
-- ONLY when that internal instruction arrives may you produce spoken audio.
+CRITICAL COMMAND + TRANSPORT RULE
+- Live microphone audio is primarily listening/transcription context. NEVER speak, answer, acknowledge, translate, or react to ordinary live microphone audio by itself.
+- You have exactly two command tools: mimi_speak and mimi_translate.
+- If you hear the Vietnamese control phrase "Mimi nói", call mimi_speak immediately and put the complete Person 1 utterance immediately before the command into source_text.
+- If you hear the Vietnamese control phrase "Mimi dịch", call mimi_translate immediately and put the complete Person 2 utterance immediately before the command into source_text.
+- The phrase "Mimi dịch" is ALWAYS a Vietnamese app command even if the active speaker just spoke Chinese or another language. Give these two command phrases special priority and do not force them into the active conversation language.
+- Do not call a command tool merely because someone discusses the words as content; call it when the phrase is clearly used as the app control command.
+- After a command tool call, the client will send a tool response. Do NOT speak after the tool response. Wait for the private internal text instruction beginning exactly with [MIMI_EXECUTE].
+- ONLY when [MIMI_EXECUTE] arrives may you produce spoken audio.
 - When you do speak, output ONLY the translated utterance. No introduction, no explanation, no quotation marks, no "Mimi says", no extra comment.
 
 INTERPRETING RULES
@@ -260,6 +300,7 @@ async function connectGemini() {
           systemInstruction: {
             parts: [{ text: buildSystemInstruction() }],
           },
+          tools: COMMAND_TOOLS,
           realtimeInputConfig: {
             automaticActivityDetection: {
               disabled: false,
@@ -290,6 +331,10 @@ async function connectGemini() {
           return;
         }
 
+        if (response.toolCall) {
+          await handleToolCall(response.toolCall);
+        }
+
         await handleServerMessage(response);
       } catch (error) {
         console.error('Mimi message handling error:', error);
@@ -305,6 +350,81 @@ async function connectGemini() {
         showError('Kết nối Gemini đã bị đóng. Bấm KẾT THÚC rồi BẮT ĐẦU lại để tạo phiên mới.');
       }
     };
+  });
+}
+
+async function handleToolCall(toolCall) {
+  if (!state.running || state.playGate || !toolCall?.functionCalls?.length) return;
+
+  const functionResponses = [];
+  let requested = null;
+
+  for (const fc of toolCall.functionCalls) {
+    const type = fc.name === 'mimi_speak'
+      ? 'SPEAK'
+      : fc.name === 'mimi_translate'
+        ? 'TRANSLATE'
+        : null;
+
+    if (!type) {
+      functionResponses.push({
+        name: fc.name,
+        id: fc.id,
+        response: { result: 'unsupported_tool' },
+      });
+      continue;
+    }
+
+    const fromTool = stripCommandFallback(String(fc.args?.source_text || '')).trim();
+    const fromTranscript = stripCommandFallback(state.transcriptBuffer).trim();
+
+    // Prefer input transcription when it already contains real source speech,
+    // because it tends to preserve numbers/product codes verbatim. If Gemini's
+    // command tool fires before transcription catches up, source_text from the
+    // tool is the fallback that makes the reverse direction reliable.
+    const sourceText = fromTranscript.length >= 2 ? fromTranscript : fromTool;
+
+    requested = { type, sourceText, name: fc.name };
+
+    functionResponses.push({
+      name: fc.name,
+      id: fc.id,
+      response: { result: 'accepted_wait_for_mimi_execute' },
+    });
+  }
+
+  // Gemini 3.1 Live function calls are synchronous, so acknowledge immediately
+  // to unblock the session before starting the client's translation flow.
+  if (functionResponses.length) {
+    sendJson({ toolResponse: { functionResponses } });
+  }
+
+  if (!requested) return;
+
+  const now = Date.now();
+  if (now - state.lastCommandAt < 650) return;
+  state.lastCommandAt = now;
+
+  const label = requested.type === 'SPEAK' ? 'Mimi nói' : 'Mimi dịch';
+  setStatus('translating', `Đã nhận lệnh “${label}”`);
+
+  // If the tool arrives just ahead of transcription, wait only a fraction of a
+  // second. This keeps the command feeling instant while still catching late STT.
+  let sourceText = requested.sourceText;
+  if (!sourceText) {
+    await new Promise((resolve) => setTimeout(resolve, 260));
+    sourceText = stripCommandFallback(state.transcriptBuffer).trim();
+  }
+
+  if (!sourceText) {
+    state.pendingCommand = { type: requested.type, at: Date.now() };
+    setStatus('listening', `Đã nghe “${label}” · đang chốt câu...`);
+    return;
+  }
+
+  executeTranslation(requested.type, sourceText).catch((error) => {
+    console.error(error);
+    recoverFromTranslationError(error.message || 'Không dịch được.');
   });
 }
 
@@ -503,7 +623,10 @@ async function startMimi() {
     await state.player.ensureContext();
 
     state.mic = new MicrophoneCapture({
-      gateEnabled: true,
+      // IMPORTANT: never hard-gate microphone audio on-device. A soft or slightly
+      // farther-away "Mimi dịch" must still reach Gemini. Browser noise suppression
+      // + Gemini server VAD do the filtering; local VAD is only used as a fast turn hint.
+      gateEnabled: false,
       onPcmChunk: sendAudio,
       onLevel: updateMicMeter,
       onSpeechStart: () => { state.localSpeechActive = true; },
