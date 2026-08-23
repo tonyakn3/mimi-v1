@@ -7,507 +7,210 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const PUBLIC_DIR = resolve(__dirname, 'public');
 const PORT = Number(process.env.PORT || 3000);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const PUBLIC_ORIGIN = (process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '');
-
-const LIVE_MODEL = 'gemini-3.1-flash-live-preview';
-// Stable, low-latency multimodal model used only for recognizing the two fixed
-// Vietnamese commands and, when needed, recovering the source transcript.
-const COMMAND_MODEL = 'gemini-3.5-flash-lite';
+const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '';
+const COMMAND_MODEL = 'gemini-3.1-flash-lite';
+const TRANSLATE_MODEL = 'gemini-3.5-flash';
+const TTS_MODEL = 'gemini-3.1-flash-tts-preview';
+const TTS_VOICE = process.env.MIMI_TTS_VOICE || 'Kore';
 
 const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
+  '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8', '.webmanifest': 'application/manifest+json; charset=utf-8', '.png': 'image/png',
+  '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
 };
 
-const recentTokenRequests = new Map();
-const recentCommandRequests = new Map();
-const RATE_WINDOW_MS = 60_000;
-const TOKEN_RATE_LIMIT = 24;
-const COMMAND_RATE_LIMIT = 90;
+const LED_GLOSSARY = [
+  'LED display', 'màn hình LED', 'LED显示屏', 'pixel pitch', 'module', 'cabinet', 'receiving card', 'sending card', 'HUB board',
+  'scan mode', 'refresh rate', 'grayscale', 'brightness', 'nits', 'SMD', 'COB', 'GOB', 'driver IC', 'power supply',
+  'front maintenance', 'rear maintenance', 'indoor', 'outdoor', 'rental screen', 'fixed installation', 'NovaStar', 'Nova',
+  'Colorlight', 'Huidu', '3840Hz', '7680Hz', 'ICN2053', 'Nationstar', 'Kinglight', 'P1.25', 'P1.5', 'P1.8', 'P2', 'P2.5', 'P2.6', 'P2.9', 'P3', 'P4',
+];
 
-function securityHeaders(extra = {}) {
+function headers(extra = {}) {
   return {
-    'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer',
-    'Permissions-Policy': 'microphone=(self)',
-    'Cross-Origin-Opener-Policy': 'same-origin-allow-popups',
-    'Content-Security-Policy': [
-      "default-src 'self'",
-      "script-src 'self'",
-      "style-src 'self'",
-      "img-src 'self' data:",
-      "connect-src 'self' https://generativelanguage.googleapis.com wss://generativelanguage.googleapis.com",
-      "media-src 'self' blob:",
-      "worker-src 'self'",
-      "manifest-src 'self'",
-      "base-uri 'self'",
-      "frame-ancestors 'none'",
-    ].join('; '),
-    ...extra,
+    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Permissions-Policy': 'microphone=(self)',
+    'Cross-Origin-Opener-Policy': 'same-origin', ...extra,
   };
 }
-
-function json(res, status, payload, headers = {}) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, securityHeaders({
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-    'Cache-Control': 'no-store',
-    ...headers,
-  }));
+function json(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, headers({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' }));
   res.end(body);
 }
-
-function getClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded) return forwarded.split(',')[0].trim();
-  return req.socket.remoteAddress || 'unknown';
-}
-
-function isRateLimited(store, req, limit) {
-  const ip = getClientIp(req);
-  const now = Date.now();
-  const list = (store.get(ip) || []).filter((time) => now - time < RATE_WINDOW_MS);
-  if (list.length >= limit) return true;
-  list.push(now);
-  store.set(ip, list);
-  return false;
-}
-
 function originAllowed(req) {
-  const origin = req.headers.origin;
-  if (!origin) return true;
+  const origin = req.headers.origin; if (!origin) return true;
   if (PUBLIC_ORIGIN) return origin === PUBLIC_ORIGIN;
-  const host = req.headers.host;
-  if (!host) return false;
-  return origin === `https://${host}` || origin === `http://${host}`;
+  const host = req.headers.host; return Boolean(host && (origin === `https://${host}` || origin === `http://${host}`));
 }
-
-async function readJsonBody(req, maxBytes = 16_384) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > maxBytes) throw new Error('BODY_TOO_LARGE');
-    chunks.push(chunk);
-  }
-  if (!chunks.length) return {};
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+async function readJsonBody(req, maxBytes = 4_500_000) {
+  const chunks = []; let size = 0;
+  for await (const chunk of req) { size += chunk.length; if (size > maxBytes) throw new Error('BODY_TOO_LARGE'); chunks.push(chunk); }
+  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
 }
-
 function pcm16ToWav(pcmBuffer, sampleRate = 16000) {
-  const dataLength = pcmBuffer.length - (pcmBuffer.length % 2);
-  const wav = Buffer.alloc(44 + dataLength);
-  wav.write('RIFF', 0);
-  wav.writeUInt32LE(36 + dataLength, 4);
-  wav.write('WAVE', 8);
-  wav.write('fmt ', 12);
-  wav.writeUInt32LE(16, 16);
-  wav.writeUInt16LE(1, 20);
-  wav.writeUInt16LE(1, 22);
-  wav.writeUInt32LE(sampleRate, 24);
-  wav.writeUInt32LE(sampleRate * 2, 28);
-  wav.writeUInt16LE(2, 32);
-  wav.writeUInt16LE(16, 34);
-  wav.write('data', 36);
-  wav.writeUInt32LE(dataLength, 40);
-  pcmBuffer.copy(wav, 44, 0, dataLength);
-  return wav;
+  const dataLength = pcmBuffer.length - (pcmBuffer.length % 2); const wav = Buffer.alloc(44 + dataLength);
+  wav.write('RIFF', 0); wav.writeUInt32LE(36 + dataLength, 4); wav.write('WAVE', 8); wav.write('fmt ', 12); wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22); wav.writeUInt32LE(sampleRate, 24); wav.writeUInt32LE(sampleRate * 2, 28);
+  wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(dataLength, 40);
+  pcmBuffer.copy(wav, 44, 0, dataLength); return wav;
 }
-
-function validateAudioPayload(body) {
-  const audio = String(body.audio || '');
-  const sampleRate = Number(body.sampleRate || 16000);
-  if (!audio || !Number.isFinite(sampleRate) || sampleRate < 8000 || sampleRate > 48000) {
-    throw new Error('INVALID_AUDIO');
-  }
-  return { audio, sampleRate };
+function parseAudio(body) {
+  const audio = String(body.audio || ''); const sampleRate = Number(body.sampleRate || 16000);
+  if (!audio || !Number.isFinite(sampleRate) || sampleRate < 8000 || sampleRate > 48000) throw new Error('INVALID_AUDIO');
+  return { pcm: Buffer.from(audio, 'base64'), sampleRate };
 }
-
-function commandPhrase(expected) {
-  return expected === 'TRANSLATE' ? 'Mimi dịch' : 'Mimi nói';
+function languageLabel(value) {
+  if (!value || typeof value !== 'object') return 'Unknown';
+  return `${String(value.name || value.code || '').slice(0, 80)} (${String(value.code || '').slice(0, 24)})`;
 }
+function commandPhrase(expected) { return expected === 'REVERSE' ? 'dịch lại' : 'Mimi nói'; }
 
-function normalizeExpected(expected) {
-  return expected === 'TRANSLATE' ? 'TRANSLATE' : 'SPEAK';
-}
-
-async function geminiGenerate({ model, prompt, wav, generationConfig }) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': GEMINI_API_KEY,
-      },
-      body: JSON.stringify({
-        contents: [{
-          role: 'user',
-          parts: [
-            { text: prompt },
-            { inlineData: { mimeType: 'audio/wav', data: wav.toString('base64') } },
-          ],
-        }],
-        ...(generationConfig ? { generationConfig } : {}),
-      }),
-    },
-  );
-
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const details = data?.error?.message || `Gemini HTTP ${response.status}`;
-    throw new Error(details);
-  }
-
-  const text = (data?.candidates?.[0]?.content?.parts || [])
-    .map((part) => part?.text || '')
-    .join(' ')
-    .trim();
-
-  return text;
-}
-
-async function detectExpectedCommandFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPEAK') {
-  const raw = Buffer.from(base64Pcm, 'base64');
-  if (raw.length < 1000) {
-    return {
-      commandDetected: false,
-      wakeDetected: false,
-      intentDetected: false,
-      speechAfterIntent: false,
-      boundaryBeforeWake: false,
-      isolatedCommand: false,
-    };
-  }
-
-  // V1.8: classify the control phrase as two parts: wake word "Mimi" and the
-  // state-locked intent word. This avoids treating the shared "Mimi" prefix as
-  // the command by itself. Only the expected command for the active turn can fire.
-  const maxBytes = Math.floor(sampleRate * 2 * 5.2);
-  const tail = raw.length > maxBytes ? raw.subarray(raw.length - maxBytes) : raw;
-  const wav = pcm16ToWav(tail, sampleRate);
-  const expectedPhrase = commandPhrase(expected);
-  const expectedIntent = expected === 'TRANSLATE' ? 'dịch' : 'nói';
-
-  const prompt = [
-    'You are the strict command recognizer for a Vietnamese voice interpreter app named Mimi.',
-    `ACTIVE TURN EXPECTS ONLY: "${expectedPhrase}".`,
-    'Treat the command as TWO stages: wake word = "Mimi", then intent word = the expected final word.',
-    `Expected intent word: "${expectedIntent}".`,
-    'Listen to the END of the supplied audio, especially the last 2 seconds.',
-    'A valid command requires ALL of these:',
-    '1) the speaker audibly says the wake word "Mimi";',
-    `2) after Mimi, the speaker audibly says the expected intent word "${expectedIntent}";`,
-    '3) there is no meaningful speech after that intent word;',
-    '4) either the command is a short standalone utterance OR there is a clear phrase/sentence boundary or natural pause before "Mimi".',
-    'Do NOT trigger if "Mimi" and the intent are merely discussed inside a longer sentence.',
-    'Do NOT trigger if words continue after the command phrase, e.g. "Mimi dịch câu này..." or "Mimi nói chuyện...".',
-    'Do NOT trigger on the wake word "Mimi" alone.',
-    'Do NOT infer a command from context. Judge only the actual audio.',
-    'Accept natural Southern Vietnamese pronunciation and a short unreleased final consonant in "dịch". Mild noise/clipping is okay.',
-    'The audio before the command may be Chinese, English, Vietnamese, mixed technical speech, or room noise; ignore its language when recognizing the final Vietnamese command.',
-    'Return JSON matching the schema only.',
-  ].join('\n');
-
-  const text = await geminiGenerate({
-    model: COMMAND_MODEL,
-    prompt,
-    wav,
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'OBJECT',
-        properties: {
-          wakeDetected: { type: 'BOOLEAN' },
-          intentDetected: { type: 'BOOLEAN' },
-          speechAfterIntent: { type: 'BOOLEAN' },
-          boundaryBeforeWake: { type: 'BOOLEAN' },
-          isolatedCommand: { type: 'BOOLEAN' },
-        },
-        required: ['wakeDetected', 'intentDetected', 'speechAfterIntent', 'boundaryBeforeWake', 'isolatedCommand'],
-        additionalProperties: false,
-      },
-    },
-  });
-
-  try {
-    const parsed = JSON.parse(text);
-    const wakeDetected = Boolean(parsed.wakeDetected);
-    const intentDetected = Boolean(parsed.intentDetected);
-    const speechAfterIntent = Boolean(parsed.speechAfterIntent);
-    const boundaryBeforeWake = Boolean(parsed.boundaryBeforeWake);
-    const isolatedCommand = Boolean(parsed.isolatedCommand);
-    const commandDetected = wakeDetected
-      && intentDetected
-      && !speechAfterIntent
-      && (boundaryBeforeWake || isolatedCommand);
-
-    return {
-      commandDetected,
-      wakeDetected,
-      intentDetected,
-      speechAfterIntent,
-      boundaryBeforeWake,
-      isolatedCommand,
-    };
-  } catch {
-    throw new Error('Gemini trả dữ liệu command detector không hợp lệ.');
-  }
-}
-
-async function resolveTurnFromPcm(base64Pcm, sampleRate = 16000, expected = 'SPEAK', sourceLanguage = '') {
-  const raw = Buffer.from(base64Pcm, 'base64');
-  if (raw.length < 1000) return { commandDetected: true, sourceText: '' };
-
-  // V1.8: the dedicated wake+intent detector already confirmed the command.
-  // Do NOT ask a second model call to decide whether the command exists again;
-  // that second decision was able to lose "Mimi dịch". This step only recovers
-  // the source speech that occurred before the confirmed trailing command.
-  const wav = pcm16ToWav(raw, sampleRate);
-  const expectedPhrase = commandPhrase(expected);
-  const prompt = [
-    'You are recovering the source speech from one already-confirmed interpreter turn.',
-    `Source language: ${sourceLanguage || 'the language spoken before the command'}.`,
-    `The trailing Vietnamese app command "${expectedPhrase}" has ALREADY BEEN CONFIRMED by a separate detector.`,
-    `Transcribe ALL meaningful source speech that came before the final command "${expectedPhrase}" in its ORIGINAL language.`,
-    'Remove only that final command and trailing silence/noise. Do not translate the source.',
-    'If the command was spoken as a separate short utterance after the source, keep the earlier source speech.',
-    'Preserve numbers, prices, currencies, dimensions, model numbers, brands, product codes, English technical terms and mixed-language terms exactly when audible.',
-    'Ignore room noise and residual Mimi speaker echo.',
-    'If there is genuinely no source speech before the command, return an empty sourceText.',
-    'Return JSON matching the provided schema only.',
-  ].join('\n');
-
-  const text = await geminiGenerate({
-    model: COMMAND_MODEL,
-    prompt,
-    wav,
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'OBJECT',
-        properties: {
-          sourceText: { type: 'STRING' },
-        },
-        required: ['sourceText'],
-        additionalProperties: false,
-      },
-    },
-  });
-
-  try {
-    const parsed = JSON.parse(text);
-    return {
-      commandDetected: true,
-      sourceText: String(parsed.sourceText || '').replace(/\s+/g, ' ').trim(),
-    };
-  } catch {
-    throw new Error('Gemini trả dữ liệu resolver không hợp lệ.');
-  }
-}
-
-async function createEphemeralToken() {
-  const now = Date.now();
-  const expireTime = new Date(now + 30 * 60 * 1000).toISOString();
-  const newSessionExpireTime = new Date(now + 60 * 1000).toISOString();
-
-  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/auth_tokens', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': GEMINI_API_KEY,
-    },
+async function generateContent({ model, prompt, wav, generationConfig }) {
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
     body: JSON.stringify({
-      uses: 1,
-      expireTime,
-      newSessionExpireTime,
+      contents: [{ role: 'user', parts: [{ text: prompt }, ...(wav ? [{ inlineData: { mimeType: 'audio/wav', data: wav.toString('base64') } }] : [])] }],
+      ...(generationConfig ? { generationConfig } : {}),
     }),
   });
-
   const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.name) {
-    const details = data?.error?.message || `Gemini auth_tokens HTTP ${response.status}`;
-    throw new Error(details);
-  }
+  if (!response.ok) throw new Error(data?.error?.message || `Gemini HTTP ${response.status}`);
+  return data;
+}
 
+async function detectCommand(pcm, sampleRate, expected) {
+  if (pcm.length < 700) return { commandDetected: false, heardText: '' };
+  const maxBytes = Math.floor(sampleRate * 2 * 7); const tail = pcm.length > maxBytes ? pcm.subarray(pcm.length - maxBytes) : pcm;
+  const phrase = commandPhrase(expected);
+  const prompt = [
+    'You are a strict Vietnamese voice-command recognizer for a two-person interpreter app.',
+    `The ONLY valid command in this state is exactly: "${phrase}".`,
+    'The phrase may be spoken alone OR at the very end of a longer utterance. It is valid only if there is no meaningful speech after the command.',
+    'Ignore punctuation, natural Southern Vietnamese pronunciation, mild room noise, and small pronunciation variations.',
+    'Do not trigger merely because individual words appear separately. Do not trigger when the phrase is followed by more conversational content.',
+    'Return JSON only. heardText should be a short transcription of the final words you heard.',
+  ].join('\n');
+  const data = await generateContent({
+    model: COMMAND_MODEL, prompt, wav: pcm16ToWav(tail, sampleRate),
+    generationConfig: {
+      responseMimeType: 'application/json', responseSchema: {
+        type: 'OBJECT', properties: { commandDetected: { type: 'BOOLEAN' }, heardText: { type: 'STRING' } },
+        required: ['commandDetected', 'heardText'], additionalProperties: false,
+      },
+    },
+  });
+  const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p?.text || '').join('').trim();
+  const parsed = JSON.parse(text || '{}');
+  return { commandDetected: Boolean(parsed.commandDetected), heardText: String(parsed.heardText || '').slice(0, 160) };
+}
+
+async function translateTurn({ pcm, sampleRate, commandPhrase: phrase, sourceLanguage, targetLanguage, direction }) {
+  const source = languageLabel(sourceLanguage), target = languageLabel(targetLanguage);
+  const prompt = [
+    'You are Mimi, a professional human interpreter. This request is completely STATELESS: use ONLY the supplied audio and nothing from any earlier turn.',
+    `Direction: ${direction}. Source language: ${source}. Target language: ${target}.`,
+    `The audio contains the source speaker's current turn, followed at the end by the Vietnamese control phrase "${phrase}".`,
+    `Extract ALL meaningful source speech BEFORE the final control phrase. Remove the control phrase itself. Then translate the extracted source naturally into ${target}.`,
+    'Never answer the speaker. Never add explanations, advice, apologies, or information not spoken.',
+    'Translate meaning naturally rather than word-for-word. Preserve directness, humor, politeness level, slang, local expressions and business intent.',
+    'Understand Southern Vietnamese colloquial speech such as xài, hông, mắc, tao bao, and understand natural local/slang expressions in the other language from context.',
+    `LED/technical glossary context: ${LED_GLOSSARY.join(', ')}. Keep brands, model names, product codes and established industry terms natural and accurate.`,
+    'Preserve every number, price, currency, quantity, dimension, date, voltage, frequency, model code and proper name exactly. Never invent or round.',
+    'If a critical number/model is genuinely unintelligible, set unclearCritical=true rather than guessing.',
+    'Return JSON only with sourceText, translationText, unclearCritical.',
+  ].join('\n');
+  const data = await generateContent({
+    model: TRANSLATE_MODEL, prompt, wav: pcm16ToWav(pcm, sampleRate),
+    generationConfig: {
+      responseMimeType: 'application/json', responseSchema: {
+        type: 'OBJECT', properties: {
+          sourceText: { type: 'STRING' }, translationText: { type: 'STRING' }, unclearCritical: { type: 'BOOLEAN' },
+        }, required: ['sourceText', 'translationText', 'unclearCritical'], additionalProperties: false,
+      },
+    },
+  });
+  const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p?.text || '').join('').trim();
+  const parsed = JSON.parse(text || '{}');
   return {
-    token: data.name,
-    expireTime: data.expireTime || expireTime,
-    newSessionExpireTime: data.newSessionExpireTime || newSessionExpireTime,
+    sourceText: String(parsed.sourceText || '').trim(), translationText: String(parsed.translationText || '').trim(),
+    unclearCritical: Boolean(parsed.unclearCritical),
   };
+}
+
+async function synthesizeSpeech(text, language) {
+  const isVietnamese = String(language?.code || '').toLowerCase().startsWith('vi');
+  const profile = isVietnamese
+    ? 'Speak as a natural adult Vietnamese woman from Southern Vietnam/Saigon: warm, clear, professional, conversational, natural pace, not a newsreader and not robotic.'
+    : `Speak as a natural adult female interpreter in ${languageLabel(language)}: clear, professional, conversational, natural pace.`;
+  const prompt = `${profile}\nRead EXACTLY the translation below. Do not add, remove, explain, paraphrase, or introduce it.\n\nTRANSLATION:\n${text}`;
+  const data = await generateContent({
+    model: TTS_MODEL, prompt,
+    generationConfig: {
+      responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } },
+    },
+  });
+  const part = (data?.candidates?.[0]?.content?.parts || []).find((p) => p?.inlineData?.data);
+  if (!part?.inlineData?.data) throw new Error('Gemini TTS không trả audio.');
+  return { audio: part.inlineData.data, sampleRate: 24000 };
 }
 
 async function serveStatic(req, res, pathname) {
-  let requested = decodeURIComponent(pathname);
-  if (requested === '/') requested = '/index.html';
-
+  let requested = decodeURIComponent(pathname); if (requested === '/') requested = '/index.html';
   const safePath = normalize(requested).replace(/^(\.\.(\/|\\|$))+/, '');
   const filePath = resolve(PUBLIC_DIR, `.${safePath.startsWith('/') ? safePath : `/${safePath}`}`);
-  if (!filePath.startsWith(PUBLIC_DIR)) {
-    json(res, 403, { error: 'Forbidden' });
-    return;
-  }
-
+  if (!filePath.startsWith(PUBLIC_DIR)) { json(res, 403, { error: 'Forbidden' }); return; }
   try {
-    const info = await stat(filePath);
-    const actualPath = info.isDirectory() ? join(filePath, 'index.html') : filePath;
-    const data = await readFile(actualPath);
-    const ext = extname(actualPath).toLowerCase();
-    const immutable = /\/icons\//.test(actualPath);
-    res.writeHead(200, securityHeaders({
-      'Content-Type': MIME[ext] || 'application/octet-stream',
-      'Content-Length': data.length,
-      'Cache-Control': immutable ? 'public, max-age=86400' : 'no-cache, no-store, must-revalidate',
-    }));
-    res.end(data);
+    const info = await stat(filePath); const actual = info.isDirectory() ? join(filePath, 'index.html') : filePath; const data = await readFile(actual);
+    const ext = extname(actual).toLowerCase();
+    res.writeHead(200, headers({ 'Content-Type': MIME[ext] || 'application/octet-stream', 'Content-Length': data.length, 'Cache-Control': /\/icons\//.test(actual) ? 'public, max-age=86400' : 'no-cache, no-store, must-revalidate' })); res.end(data);
   } catch {
-    try {
-      const index = await readFile(join(PUBLIC_DIR, 'index.html'));
-      res.writeHead(200, securityHeaders({
-        'Content-Type': 'text/html; charset=utf-8',
-        'Content-Length': index.length,
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-      }));
-      res.end(index);
-    } catch {
-      json(res, 404, { error: 'Not found' });
-    }
+    const index = await readFile(join(PUBLIC_DIR, 'index.html')); res.writeHead(200, headers({ 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': index.length, 'Cache-Control': 'no-cache, no-store, must-revalidate' })); res.end(index);
   }
 }
 
 const server = http.createServer(async (req, res) => {
   try {
-    const base = `http://${req.headers.host || 'localhost'}`;
-    const url = new URL(req.url || '/', base);
-
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     if (url.pathname === '/api/health' && req.method === 'GET') {
-      json(res, 200, {
-        ok: true,
-        version: '1.8.0',
-        apiKeyConfigured: Boolean(GEMINI_API_KEY),
-        liveModel: LIVE_MODEL,
-        commandModel: COMMAND_MODEL,
-      });
-      return;
+      json(res, 200, { ok: true, version: '2.0.0', apiKeyConfigured: Boolean(GEMINI_API_KEY), commandModel: COMMAND_MODEL, translateModel: TRANSLATE_MODEL, ttsModel: TTS_MODEL }); return;
     }
+    if (url.pathname.startsWith('/api/') && !originAllowed(req)) { json(res, 403, { error: 'Origin không được phép.' }); return; }
+    if (url.pathname.startsWith('/api/') && !GEMINI_API_KEY) { json(res, 503, { error: 'Backend chưa có GEMINI_API_KEY.' }); return; }
 
     if (url.pathname === '/api/detect-command' && req.method === 'POST') {
-      if (!originAllowed(req)) {
-        json(res, 403, { error: 'Origin không được phép.' });
-        return;
-      }
-      if (isRateLimited(recentCommandRequests, req, COMMAND_RATE_LIMIT)) {
-        json(res, 429, { error: 'Command detector đang nhận quá nhiều yêu cầu.' });
-        return;
-      }
-      if (!GEMINI_API_KEY) {
-        json(res, 503, { error: 'Backend chưa có GEMINI_API_KEY.' });
-        return;
-      }
-
       try {
-        const body = await readJsonBody(req, 900_000);
-        const { audio, sampleRate } = validateAudioPayload(body);
-        const expected = normalizeExpected(body.expected);
-        const result = await detectExpectedCommandFromPcm(audio, sampleRate, expected);
-        json(res, 200, {
-          command: result.commandDetected ? expected : 'NONE',
-          expected,
-          wakeDetected: result.wakeDetected,
-          intentDetected: result.intentDetected,
-          speechAfterIntent: result.speechAfterIntent,
-          boundaryBeforeWake: result.boundaryBeforeWake,
-          isolatedCommand: result.isolatedCommand,
-        });
-      } catch (error) {
-        console.error('Command detector error:', error.message);
-        json(res, 502, { error: `Không nhận diện được câu lệnh: ${error.message}` });
-      }
+        const body = await readJsonBody(req, 1_100_000); const { pcm, sampleRate } = parseAudio(body);
+        const expected = body.expected === 'REVERSE' ? 'REVERSE' : 'SPEAK'; const result = await detectCommand(pcm, sampleRate, expected);
+        json(res, 200, { ...result, expected, phrase: commandPhrase(expected) });
+      } catch (error) { console.error('detect-command:', error.message); json(res, 502, { error: `Không nhận diện được câu lệnh: ${error.message}` }); }
       return;
     }
 
-    if (url.pathname === '/api/resolve-turn' && req.method === 'POST') {
-      if (!originAllowed(req)) {
-        json(res, 403, { error: 'Origin không được phép.' });
-        return;
-      }
-      if (isRateLimited(recentCommandRequests, req, COMMAND_RATE_LIMIT)) {
-        json(res, 429, { error: 'Turn resolver đang nhận quá nhiều yêu cầu.' });
-        return;
-      }
-      if (!GEMINI_API_KEY) {
-        json(res, 503, { error: 'Backend chưa có GEMINI_API_KEY.' });
-        return;
-      }
-
+    if (url.pathname === '/api/translate-turn' && req.method === 'POST') {
       try {
-        const body = await readJsonBody(req, 4_500_000);
-        const { audio, sampleRate } = validateAudioPayload(body);
-        const expected = normalizeExpected(body.expected);
-        const sourceLanguage = String(body.sourceLanguage || '').slice(0, 120);
-        const result = await resolveTurnFromPcm(audio, sampleRate, expected, sourceLanguage);
+        const body = await readJsonBody(req, 4_600_000); const { pcm, sampleRate } = parseAudio(body);
+        const phrase = String(body.commandPhrase || '').slice(0, 40); if (!phrase) throw new Error('MISSING_COMMAND');
+        const result = await translateTurn({ pcm, sampleRate, commandPhrase: phrase, sourceLanguage: body.sourceLanguage, targetLanguage: body.targetLanguage, direction: String(body.direction || '') });
         json(res, 200, result);
-      } catch (error) {
-        console.error('Turn resolver error:', error.message);
-        json(res, 502, { error: `Không chốt được câu nguồn: ${error.message}` });
-      }
+      } catch (error) { console.error('translate-turn:', error.message); json(res, 502, { error: `Không dịch được lượt nói: ${error.message}` }); }
       return;
     }
 
-    if (url.pathname === '/api/live-token' && req.method === 'POST') {
-      if (!originAllowed(req)) {
-        json(res, 403, { error: 'Origin không được phép.' });
-        return;
-      }
-      if (isRateLimited(recentTokenRequests, req, TOKEN_RATE_LIMIT)) {
-        json(res, 429, { error: 'Bạn đang tạo quá nhiều phiên. Hãy chờ khoảng một phút rồi thử lại.' });
-        return;
-      }
-      if (!GEMINI_API_KEY) {
-        json(res, 503, {
-          error: 'Backend chưa có GEMINI_API_KEY. Hãy thêm key vào Environment Variables của Render.',
-        });
-        return;
-      }
-
-      const body = await readJsonBody(req);
-      if (body.model && body.model !== LIVE_MODEL) {
-        json(res, 400, { error: 'Model không được phép.' });
-        return;
-      }
-
+    if (url.pathname === '/api/tts' && req.method === 'POST') {
       try {
-        const token = await createEphemeralToken();
-        json(res, 200, { ...token, model: LIVE_MODEL });
-      } catch (error) {
-        console.error('Ephemeral token error:', error.message);
-        json(res, 502, { error: `Không tạo được Gemini token: ${error.message}` });
-      }
+        const body = await readJsonBody(req, 80_000); const text = String(body.text || '').trim(); if (!text || text.length > 12000) throw new Error('INVALID_TEXT');
+        const result = await synthesizeSpeech(text, body.language || {}); json(res, 200, result);
+      } catch (error) { console.error('tts:', error.message); json(res, 502, { error: `Không tạo được giọng nói: ${error.message}` }); }
       return;
     }
 
-    if (!['GET', 'HEAD'].includes(req.method || '')) {
-      json(res, 405, { error: 'Method not allowed' });
-      return;
-    }
-
+    if (!['GET', 'HEAD'].includes(req.method || '')) { json(res, 405, { error: 'Method not allowed' }); return; }
     await serveStatic(req, res, url.pathname);
-  } catch (error) {
-    console.error(error);
-    json(res, 500, { error: 'Server error' });
-  }
+  } catch (error) { console.error(error); json(res, 500, { error: 'Server error' }); }
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Mimi V1.8 đang chạy tại http://localhost:${PORT}`);
+  console.log(`Mimi V2.0 Reset Loop đang chạy tại http://localhost:${PORT}`);
   console.log(`Gemini API key: ${GEMINI_API_KEY ? 'đã cấu hình' : 'CHƯA cấu hình'}`);
-  console.log(`Live model: ${LIVE_MODEL} | Command model: ${COMMAND_MODEL}`);
+  console.log(`Models: command=${COMMAND_MODEL}, translate=${TRANSLATE_MODEL}, tts=${TTS_MODEL}`);
 });

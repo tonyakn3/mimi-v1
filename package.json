@@ -1,15 +1,13 @@
 {
-  "name": "mimi-live-interpreter",
-  "version": "1.8.0",
+  "name": "mimi-reset-loop-interpreter",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Mimi V1.8 - Safari/iPhone PWA interpreter with state-locked wake word + intent command engine",
+  "description": "Mimi V2.0 - stateless two-person interpreter for Safari/iPhone. Commands: Mimi nói / dịch lại. Hard reset after every translated turn.",
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test",
     "check": "node --check server.mjs && node --check public/js/app.js && node --check public/js/audio.js && node --check public/js/commands.js"
   },
-  "engines": {
-    "node": ">=20"
-  }
+  "engines": { "node": ">=20" }
 }
