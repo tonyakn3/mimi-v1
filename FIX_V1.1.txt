@@ -1,0 +1,17 @@
+MIMI V1.1 FIX
+
+Replace these 3 files in GitHub:
+1) public/js/app.js
+2) public/js/audio.js
+3) public/service-worker.js
+
+What changed:
+- Less aggressive mic/noise gate for iPhone.
+- More sensitive Gemini VAD.
+- Minimal inputAudioTranscription config for compatibility.
+- Shows live transcript in the status line (Mimi nghe: ...).
+- Explicitly ends audio stream before sending the private translation trigger.
+- Longer response timeout.
+- Service worker cache version bumped + network-first app code.
+
+After Render redeploys, on iPhone Safari refresh once. If installed to Home Screen, remove the old icon and add it again if it still shows old behavior.

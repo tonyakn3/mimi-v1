@@ -1,10 +1,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { expectedForSide, isExactCommandText, normalizeCommandText } from '../public/js/commands.js';
+import { detectMimiCommand, mergeTranscript } from '../public/js/commands.js';
 
-test('side 1 command is Mimi nói', () => assert.equal(expectedForSide(1).phrase, 'Mimi nói'));
-test('side 2 command is dịch lại', () => assert.equal(expectedForSide(2).phrase, 'dịch lại'));
-test('normalize ignores accents and punctuation', () => assert.equal(normalizeCommandText('Mimi, NÓI!'), 'mimi noi'));
-test('side 1 exact command', () => assert.equal(isExactCommandText('Mimi nói', 1), true));
-test('side 2 exact command', () => assert.equal(isExactCommandText('dịch lại', 2), true));
-test('wrong command is rejected by state', () => assert.equal(isExactCommandText('Mimi nói', 2), false));
+test('detects Mimi nói', () => {
+  const result = detectMimiCommand('Giá này cao lắm. Mimi nói');
+  assert.equal(result.type, 'SPEAK');
+  assert.equal(result.sourceText, 'Giá này cao lắm.');
+});
+
+test('detects Mi Mi dịch', () => {
+  const result = detectMimiCommand('这个价格太高了。 Mi Mi dịch');
+  assert.equal(result.type, 'TRANSLATE');
+  assert.match(result.sourceText, /这个价格太高了/);
+});
+
+test('detects commands without accents', () => {
+  assert.equal(detectMimiCommand('an trua khong mimi noi').type, 'SPEAK');
+  assert.equal(detectMimiCommand('你好 mimi dich').type, 'TRANSLATE');
+});
+
+test('merges growing partial transcript', () => {
+  let state = mergeTranscript('', 'Giá này', '');
+  state = mergeTranscript(state.buffer, 'Giá này cao lắm', state.lastChunk);
+  assert.equal(state.buffer, 'Giá này cao lắm');
+});
+
+test('reverse direction survives out-of-order transcription: command arrives before Chinese source', () => {
+  const result = detectMimiCommand('Mimi dịch 这个价格太高了。');
+  assert.equal(result.type, 'TRANSLATE');
+  assert.match(result.sourceText, /这个价格太高了/);
+});
+
+test('accepts common STT variant Mimi Dick for Mimi dịch', () => {
+  const result = detectMimiCommand('这个价格太高了。 Mimi Dick');
+  assert.equal(result.type, 'TRANSLATE');
+  assert.match(result.sourceText, /这个价格太高了/);
+});

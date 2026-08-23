@@ -1,0 +1,16 @@
+Mimi V1.4 — Command range / soft voice fix
+
+Nguyên nhân: V1.3 có adaptive noise gate ở client. Nó không đo khoảng cách thật, nhưng giọng nhỏ/xa có thể rơi dưới ngưỡng RMS và bị biến thành digital silence trước khi gửi tới Gemini. Điều này đặc biệt làm mất lệnh "Mimi dịch" khi nói nhỏ sau khi nghe bản dịch.
+
+Sửa:
+- Tắt hard audio gate ở client (gateEnabled=false).
+- Vẫn giữ echoCancellation, noiseSuppression, autoGainControl, high-pass, compressor và Gemini server VAD.
+- Local VAD chỉ dùng để gợi ý kết thúc lượt nhanh, không chặn audio.
+- Nếu gate được bật lại trong tương lai, audio yên chỉ bị giảm 65%, không bị zero hoàn toàn.
+- Hạ ngưỡng local VAD để bắt giọng nhỏ tốt hơn.
+- Bump service worker cache để Safari lấy JS mới.
+
+Upload 3 file:
+public/js/app.js
+public/js/audio.js
+public/service-worker.js

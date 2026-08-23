@@ -1,0 +1,13 @@
+Mimi V1.3 — FAST COMMAND + iPhone reverse-mic fix
+
+Sửa 3 điểm chính:
+1) Hybrid VAD phía client: khi phát hiện người nói vừa dừng ~520ms, Mimi gửi audioStreamEnd để Gemini chốt transcript sớm hơn. Google Live API cho phép tiếp tục gửi audio sau audioStreamEnd.
+2) Pending command: nếu transcript "Mimi dịch" tới trước câu tiếng Trung do transcription bất đồng bộ, app sẽ giữ lệnh và chờ phần nguồn thay vì bỏ lệnh.
+3) Sau khi Mimi phát xong, app chủ động resume AudioContext + mic send gate 2 lần (ngay lập tức và sau 300ms) để Safari iPhone không bị kẹt mic ở chiều Người 2.
+
+File cần thay trên GitHub nếu đang ở V1.2:
+- public/js/app.js
+- public/js/audio.js
+- public/service-worker.js
+
+Không thay .env, server.mjs hay package.json.

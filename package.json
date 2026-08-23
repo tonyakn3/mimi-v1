@@ -1,13 +1,15 @@
 {
-  "name": "mimi-hot-live-interpreter",
-  "version": "2.1.1",
+  "name": "mimi-live-interpreter",
+  "version": "1.7.0",
   "private": true,
   "type": "module",
-  "description": "Mimi V2.1.1 - current raw Gemini Live WebSocket setup, per-turn local reset, Safari/iPhone voice interpreter.",
+  "description": "Mimi V1.7 - Safari/iPhone PWA voice interpreter with robust two-way Vietnamese command detection",
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test",
     "check": "node --check server.mjs && node --check public/js/app.js && node --check public/js/audio.js && node --check public/js/commands.js"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

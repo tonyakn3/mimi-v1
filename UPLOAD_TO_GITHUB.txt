@@ -1,22 +1,12 @@
-MIMI V2.0 - THAY 7 FILE/THU MUC NAY TREN GITHUB
+THAY 6 FILE NÀY TRÊN GITHUB
+===========================
+1. server.mjs
+2. Dockerfile
+3. package.json
+4. public/js/app.js
+5. public/js/audio.js
+6. public/service-worker.js
 
-1) server.mjs
-2) package.json
-3) Dockerfile
-4) public/index.html
-5) public/js/app.js
-6) public/js/commands.js
-7) public/service-worker.js
-
-Giu nguyen:
-- public/js/audio.js (neu repo hien tai dang la V1.8 thi file nay van tuong thich)
-- public/styles.css
-- public/icons/
-- public/manifest.webmanifest
-
-Neu muon chac chan nhat: upload toan bo noi dung trong ZIP len repo, NHUNG KHONG upload file .env cua may ban.
-
-Render:
-- Health Check Path: /api/health
-- Environment: GEMINI_API_KEY giu nguyen
-- Commit xong GitHub thi Render Auto-Deploy.
+KHÔNG UPLOAD .env.
+Sau khi Commit changes, Render sẽ Auto-Deploy.
+Health Check Path giữ là: /api/health

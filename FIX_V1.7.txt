@@ -1,0 +1,35 @@
+MIMI V1.7 — REVERSE COMMAND REBUILD
+===================================
+
+Mục tiêu của V1.7:
+- Sửa dứt điểm trường hợp "Mimi nói" chạy tốt nhưng "Mimi dịch" không phản ứng sau lượt tiếng Trung.
+- Không còn phụ thuộc duy nhất vào thứ tự input transcription của Gemini Live.
+
+Thay đổi chính:
+1. App giữ PCM của toàn bộ lượt người đang nói (tối đa khoảng 60 giây).
+2. Sau mỗi utterance, bộ detector chỉ tìm đúng command đang được chờ:
+   - đang nghe Người 1 -> chỉ tìm "Mimi nói"
+   - đang nghe Người 2 -> chỉ tìm "Mimi dịch"
+3. Khi command được nhận, backend /api/resolve-turn nghe lại audio của cả lượt để:
+   - xác nhận command ở cuối,
+   - chép lại toàn bộ câu nguồn trước command,
+   - bỏ riêng command,
+   - giữ nguyên số, giá, model, brand, thuật ngữ.
+4. Dùng gemini-3.5-flash-lite cho detector/resolver audio; Gemini Live vẫn dùng gemini-3.1-flash-live-preview để dịch/phát tiếng.
+5. Hạ ngưỡng local speech segmentation, nhưng KHÔNG hard-gate audio.
+6. Sửa một lỗi pending-command: command đã nghe có thể bị debounce rồi mất luôn khi transcript đến quá nhanh.
+7. Dockerfile không còn ENV PORT=3000; Render dùng PORT do Render cấp.
+8. Service worker đổi cache V1.7 và network-first/no-store cho JS/CSS/HTML.
+
+FILE CẦN THAY TRÊN GITHUB:
+- server.mjs
+- Dockerfile
+- package.json
+- public/js/app.js
+- public/js/audio.js
+- public/service-worker.js
+
+KHÔNG upload .env.
+GEMINI_API_KEY vẫn để trong Render -> Environment Variables.
+
+Render Health Check Path: /api/health

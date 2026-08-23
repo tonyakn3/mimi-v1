@@ -1,0 +1,18 @@
+MIMI V1.6 — DUAL COMMAND DETECTOR
+
+Mục tiêu: sửa lỗi chiều "Mimi dịch" trên Safari iPhone khi mic có nghe nhưng Gemini Live không trả transcript/command.
+
+Thay đổi:
+1. Thêm bộ nhận lệnh độc lập bằng audio ở backend: /api/detect-command.
+2. Sau mỗi câu nói kết thúc, app gửi tối đa 3.4 giây cuối của audio tới Gemini 3.1 Flash-Lite để phân loại đúng 1 trong 3 kết quả: SPEAK / TRANSLATE / NONE.
+3. Cơ chế này chạy song song với detector transcript + function tool hiện tại, nên không phụ thuộc việc Gemini Live có chép đúng chữ "Mimi dịch" hay không.
+4. Giữ source transcript của Người 2; nếu command tới trước transcript thì đợi transcript rồi mới dịch.
+5. Tăng cache version cho Safari/PWA.
+
+FILE CẦN THAY TRÊN GITHUB:
+- server.mjs
+- public/js/app.js
+- public/js/audio.js
+- public/service-worker.js
+
+Không thay .env. Không đưa API key lên GitHub.
